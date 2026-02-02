@@ -2,12 +2,13 @@ package ruebucket
 
 import (
 	"fmt"
-	"github.com/jellydator/ttlcache/v3"
 	"sync"
 	"time"
+
+	"github.com/jellydator/ttlcache/v3"
 )
 
-// Local limiters that match behaviour of the replenishable redis counterparts.
+// Local token bucket limiters that match behaviour of the replenishable redis counterparts.
 // Implemented to make it easy to use shared (redis-backed) limiters together with local (in memory) limiters.
 
 // LocalLimiter is an in-memory token bucket that uses the same semantics as the redis-backed Limiter

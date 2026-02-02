@@ -1,9 +1,10 @@
 package ruebucket
 
 import (
-	"github.com/stretchr/testify/require"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 // Tests mostly copy+paste from limiter_test.go

@@ -5,12 +5,13 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
-	"github.com/jellydator/ttlcache/v3"
-	"github.com/redis/rueidis"
 	"math"
 	"strconv"
 	"sync/atomic"
 	"time"
+
+	"github.com/jellydator/ttlcache/v3"
+	"github.com/redis/rueidis"
 )
 
 // ReplenishableKeyedLimiter is a redis-backed token bucket rate limiter that supports attempting to take tokens
@@ -204,7 +205,7 @@ func (l *Limiter) Allow(ctx context.Context) (ok bool, wait time.Duration, err e
 	return l.source.Allow(ctx, "__default__")
 }
 
-//go:embed limiter_token_bucket.lua
+//go:embed token_bucket.lua
 var luaTokenBucketScript string
 var luaTokenBucket = rueidis.NewLuaScript(luaTokenBucketScript)
 
@@ -212,11 +213,13 @@ var luaTokenBucket = rueidis.NewLuaScript(luaTokenBucketScript)
 // bucket and therefore can never be satisfied
 var ErrExceedsBucketCapacity = errors.New("request exceeds bucket capacity")
 
-// AllowEvery converts a time interval to a rate per second for use with *Limiter constructors.
+// Every converts a time interval to a rate per second for use with *Limiter constructors.
 // Similar to rate.Every, but avoids taking a dependency on that package.
-func AllowEvery(interval time.Duration) float64 {
+func Every(interval time.Duration) float64 {
 	if interval <= 0 {
 		return math.MaxFloat64
 	}
 	return 1 / interval.Seconds()
 }
+
+var AllowEvery = Every // Backwards compat

@@ -2,11 +2,12 @@ package ruebucket
 
 import (
 	"context"
-	"github.com/redis/rueidis"
-	"github.com/stretchr/testify/require"
 	"os"
 	"testing"
 	"time"
+
+	"github.com/redis/rueidis"
+	"github.com/stretchr/testify/require"
 )
 
 // Tests run against a locally running redis/valkey instance, selecting database 1.
