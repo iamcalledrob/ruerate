@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -49,6 +50,7 @@ func (o *RedisKeyedLimiterOpts) Sanitize() error {
 type RedisKeyedLimiter struct {
 	client rueidis.Client
 	opts   RedisKeyedLimiterOpts
+	script *rueidis.Lua
 }
 
 func NewRedisKeyedLimiter(client rueidis.Client, opts RedisKeyedLimiterOpts) (*RedisKeyedLimiter, error) {
@@ -56,7 +58,19 @@ func NewRedisKeyedLimiter(client rueidis.Client, opts RedisKeyedLimiterOpts) (*R
 	if err != nil {
 		return nil, fmt.Errorf("opts: %w", err)
 	}
-	return &RedisKeyedLimiter{client: client, opts: opts}, nil
+
+	// Opts don't change during limiter lifespan, more efficient to define as constants.
+	s := strings.NewReplacer(
+		"{{ RATE_PER_SEC }}", strconv.FormatFloat(opts.LimiterOpts.RatePerSec, 'f', -1, 64),
+		"{{ BUCKET_CAPACITY }}", strconv.Itoa(opts.LimiterOpts.Capacity),
+	).Replace(luaTokenBucketScript)
+	lua := rueidis.NewLuaScript(s)
+
+	return &RedisKeyedLimiter{
+		client: client,
+		opts:   opts,
+		script: lua,
+	}, nil
 }
 
 func (l *RedisKeyedLimiter) Replenish(ctx context.Context, key string) error {
@@ -78,18 +92,13 @@ func (l *RedisKeyedLimiter) AllowN(ctx context.Context, key string, n int) (ok b
 		return
 	}
 
-	limitString := strconv.FormatFloat(l.opts.LimiterOpts.RatePerSec, 'f', -1, 64)
-
-	resp := luaTokenBucket.Exec(
+	resp := l.script.Exec(
 		ctx,
 		l.client,
 		[]string{
-			l.tokensKey(key),         // lua: tokens_key
-			l.lastAcquiredAtKey(key), // lua: last_acquired_at_key
+			l.opts.RedisKey(key), // lua: state_key
 		},
 		[]string{
-			limitString, // lua: rate_per_sec
-			strconv.Itoa(l.opts.LimiterOpts.Capacity), // lua: bucket_capacity
 			strconv.Itoa(-n), // lua: tokens_delta (acquiring 1 = delta of -1)
 		},
 	)
@@ -122,16 +131,6 @@ func (l *RedisKeyedLimiter) AllowN(ctx context.Context, key string, n int) (ok b
 	}
 
 	return
-}
-
-// TODO: Remove, switch to single hash
-func (l *RedisKeyedLimiter) tokensKey(key string) string {
-	return l.opts.RedisKey(key) + ":tokens"
-}
-
-// TODO: Remove, switch to single hash
-func (l *RedisKeyedLimiter) lastAcquiredAtKey(key string) string {
-	return l.opts.RedisKey(key) + ":last_acquired"
 }
 
 // RedisCacheableKeyedLimiter is a non-replenishable limiter that caches wait durations to avoid
@@ -318,7 +317,6 @@ func (l *RedisCacheableLimiter) Allow(ctx context.Context) (ok bool, wait time.D
 
 //go:embed token_bucket.lua
 var luaTokenBucketScript string
-var luaTokenBucket = rueidis.NewLuaScript(luaTokenBucketScript)
 
 // ErrExceedsBucketCapacity means the number of tokens requested from the limiter exceeds the capacity of the
 // bucket and therefore can never be satisfied

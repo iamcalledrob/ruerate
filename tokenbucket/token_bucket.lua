@@ -1,20 +1,20 @@
 -- Token bucket that supports both adding (replenishing) and removing tokens
 -- Stores no state in redis when the bucket is completely full
 
-local tokens_key = KEYS[1]
-local last_acquired_at_key = KEYS[2]
+local state_key = KEYS[1]
 
-local rate_per_sec = tonumber(ARGV[1])
-local bucket_capacity = tonumber(ARGV[2])
-local tokens_delta = tonumber(ARGV[3])
+local rate_per_sec = {{ RATE_PER_SEC }}
+local bucket_capacity = {{ BUCKET_CAPACITY }}
+local tokens_delta = tonumber(ARGV[1])
 
 local redis_time = redis.call("TIME")
 local now_micros = tonumber(redis_time[1]) * 1e6 + tonumber(redis_time[2])
 
 -- Get how many tokens are in the bucket
 -- If no key exists, the bucket is full.
-local last_tokens   = tonumber(redis.call("GET", tokens_key) or bucket_capacity)
-local last_acquired_at_micros = tonumber(redis.call("GET", last_acquired_at_key) or now_micros)
+local state = redis.call("HMGET", state_key, "t", "la")
+local last_tokens = tonumber(state[1] or bucket_capacity)
+local last_acquired_at_micros = tonumber(state[2] or now_micros)
 
 -- Convert rate to per-microsecond
 local rate_per_micro = rate_per_sec / 1e6
@@ -41,13 +41,16 @@ local tokens_until_full = bucket_capacity - current_tokens
 
 if tokens_until_full <= 0 then
     -- Bucket has been completely filled
-    redis.call("DEL", tokens_key, last_acquired_at_key)
+    redis.call("DEL", state_key)
 else
     -- Auto-expire key at time it would become full.
     -- A missing key is treated as a full bucket.
     local time_until_full_millis = math.ceil(tokens_until_full / (rate_per_sec / 1000))
-    redis.call("SET", tokens_key, current_tokens, "PX", time_until_full_millis)
-    redis.call("SET", last_acquired_at_key, now_micros, "PX", time_until_full_millis)
+
+    -- Persist state in a single key
+    -- Merge into single HSETEX call once support is more common
+    redis.call("HSET", state_key, "t", current_tokens, "la", now_micros)
+    redis.call("PEXPIRE", state_key, time_until_full_millis)
 end
 -- Result: {Allowed, No Wait}
 return {1, 0}

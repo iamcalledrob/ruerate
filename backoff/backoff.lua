@@ -73,6 +73,7 @@ penalty = math.min(penalty + 1, max_penalty)
 local ttl_ms = math.ceil((penalty / penalty_decay_rate_per_sec) * 1000)
 
 -- Persist state in a single key
+-- Merge into single HSETEX call once support is more common
 redis.call("HSET", state_key, "p", penalty, "la", now_micros)
 redis.call("PEXPIRE", state_key, ttl_ms)
 

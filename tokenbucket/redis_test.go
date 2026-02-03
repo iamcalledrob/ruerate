@@ -42,9 +42,8 @@ func TestRedisLimiter(t *testing.T) {
 		// Check TTL.
 		// Refilling at 25/sec, the 7 tokens we took should take 0.28s (7/25) to replenish
 		// Therefore TTL should be 0.28, as expired keys = full bucket
-		// TODO: move into hash, single redis key etc...
 		var msec int64
-		resp := client.Do(t.Context(), client.B().Pttl().Key(opts.RedisKey+":tokens").Build())
+		resp := client.Do(t.Context(), client.B().Pttl().Key(opts.RedisKey).Build())
 		msec, err = resp.AsInt64()
 		require.NoError(t, err)
 
