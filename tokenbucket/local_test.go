@@ -11,7 +11,7 @@ import (
 func TestLocalLimiter(t *testing.T) {
 	// Local limiter is always replenishable
 	testLimiter_Common(t, func(opts LimiterOpts) (Limiter, error) {
-		return NewLocalLimiter(opts)
+		return NewLocalLimiter(&opts)
 	})
 }
 
@@ -41,7 +41,7 @@ func TestLocalKeyedLimiter(t *testing.T) {
 		// Therefore TTL should be 0.28, as expired keys = full bucket
 
 		// Allow 2ms slop for slow execution
-		entry := lim.buckets.Get("key")
+		entry := lim.limiters.Get("key")
 		msec := entry.TTL().Milliseconds()
 		if msec < 278 || msec > 282 {
 			t.Fatalf("TTL out of bounds: ms = %d", msec)

@@ -32,7 +32,7 @@ func NewLocalKeyedLimiter(opts LimiterOpts) (*LocalKeyedLimiter, error) {
 		) *ttlcache.Item[string, *LocalLimiter] {
 			l, lErr := NewLocalLimiter(&opts)
 			if lErr != nil {
-				panic("NewLocalBackoffLimiter failed with pre-sanitized opts: " + lErr.Error())
+				panic("NewLocalLimiter failed with pre-sanitized opts: " + lErr.Error())
 			}
 
 			// Initial ttl set to time it takes for 1 penalty to expire.
@@ -61,6 +61,7 @@ func (l *LocalKeyedLimiter) Stop() {
 func (l *LocalKeyedLimiter) Reset(ctx context.Context, key string) error {
 	// Deleting the limiter has the same effect as resetting it.
 	// A new, default one will be allocated when next needed.
+	// TODO: What happens if Delete is called during a call to Allow?
 	l.limiters.Delete(key)
 	return nil
 }
@@ -68,7 +69,6 @@ func (l *LocalKeyedLimiter) Reset(ctx context.Context, key string) error {
 func (l *LocalKeyedLimiter) Allow(ctx context.Context, key string) (ok bool, wait time.Duration, err error) {
 	entry := l.limiters.Get(key)
 
-	// TODO: Update token bucket to do the same here rather than reaching in to grab mutex
 	limiter := entry.Value()
 	ok, wait = limiter.allow(ctx, func(newTTL time.Duration) {
 		l.limiters.Set(key, limiter, newTTL)

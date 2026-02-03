@@ -9,8 +9,6 @@ import (
 	"github.com/jellydator/ttlcache/v3"
 )
 
-// TODO: Merge localTokenBucket w/ LocalLimiter, and make LocalLimiter take *opts
-
 // Local token bucket limiters that match behaviour of the replenishable redis counterparts.
 // Implemented to make it easy to use shared (redis-backed) limiters together with local (in memory) limiters.
 
@@ -20,8 +18,8 @@ import (
 // As with redis KeyedLimiter, only non-full buckets are kept in memory, and a goroutine is automatically
 // started to purge expired buckets.
 type LocalKeyedLimiter struct {
-	opts    LimiterOpts
-	buckets *ttlcache.Cache[string, *localTokenBucket]
+	opts     LimiterOpts
+	limiters *ttlcache.Cache[string, *LocalLimiter]
 }
 
 func NewLocalKeyedLimiter(opts LimiterOpts) (*LocalKeyedLimiter, error) {
@@ -30,34 +28,40 @@ func NewLocalKeyedLimiter(opts LimiterOpts) (*LocalKeyedLimiter, error) {
 		return nil, fmt.Errorf("opts: %w", err)
 	}
 
-	// Lazily create token buckets when needed
-	// Using suppressed (single flight) loader ensures that there is never more than one bucket instance
-	// per key.
-	singleFlightLoader := ttlcache.NewSuppressedLoader(ttlcache.LoaderFunc[string, *localTokenBucket](
+	// Lazily create local limiters when needed
+	// Using suppressed (single flight) loader ensures that there is never more than one
+	// limiter instance per key.
+	singleFlightLoader := ttlcache.NewSuppressedLoader(ttlcache.LoaderFunc[string, *LocalLimiter](
 		func(
-			buckets *ttlcache.Cache[string, *localTokenBucket], key string,
-		) *ttlcache.Item[string, *localTokenBucket] {
-			bucket := newLocalTokenBucket(opts.RatePerSec, opts.Capacity)
-			ttl := time.Until(bucket.fullAt())
-			return buckets.Set(key, bucket, ttl)
+			limiters *ttlcache.Cache[string, *LocalLimiter], key string,
+		) *ttlcache.Item[string, *LocalLimiter] {
+			l, lErr := NewLocalLimiter(&opts)
+			if lErr != nil {
+				panic("NewLocalLimiter failed with pre-sanitized opts: " + lErr.Error())
+			}
+
+			// Set a short, arbitrary initial TTL so the bucket doesn't get cleared from the cache
+			// TODO: Is this safe/correct?
+			ttl := 10 * time.Millisecond
+			return limiters.Set(key, l, ttl)
 		},
 	), nil)
 
-	buckets := ttlcache.New[string, *localTokenBucket](
+	limiters := ttlcache.New[string, *LocalLimiter](
 		ttlcache.WithLoader(singleFlightLoader),
-		ttlcache.WithDisableTouchOnHit[string, *localTokenBucket](), // No ttl magic, only change explicitly
+		ttlcache.WithDisableTouchOnHit[string, *LocalLimiter](), // No ttl magic, only change explicitly
 	)
 
 	// Purge expired buckets to prevent memory leak
-	go buckets.Start()
+	go limiters.Start()
 
-	return &LocalKeyedLimiter{opts: opts, buckets: buckets}, nil
+	return &LocalKeyedLimiter{opts: opts, limiters: limiters}, nil
 }
 
 // Stop stops automatically cleaning up the limiter map
 // Call when no longer using LocalKeyedLimiter to avoid a goroutine leak.
 func (l *LocalKeyedLimiter) Stop() {
-	l.buckets.Stop()
+	l.limiters.Stop()
 }
 
 func (l *LocalKeyedLimiter) Replenish(ctx context.Context, key string) error {
@@ -74,44 +78,34 @@ func (l *LocalKeyedLimiter) ReplenishN(ctx context.Context, key string, n int) e
 }
 
 func (l *LocalKeyedLimiter) AllowN(_ context.Context, key string, n int) (ok bool, wait time.Duration, err error) {
-	if n > l.opts.Capacity {
-		err = fmt.Errorf("%w: n (%d) > capacity (%d)", ErrExceedsBucketCapacity, n, l.opts.Capacity)
-		return
-	}
+	entry := l.limiters.Get(key)
+	// TODO: Is this not a race condition? What if bucket gets cleared by its TTL here, and so we end up
+	//       with 2x buckets "in flight"? As LocalKeyedLimiter doesn't serialize calls to AllowN etc.
 
-	// Auto-instantiated if not yet set, so should never return nil
-	entry := l.buckets.Get(key)
-	bucket := entry.Value()
+	limiter := entry.Value()
+	ok, wait, err = limiter.update(-n, func(newTTL time.Duration) {
+		l.limiters.Set(key, limiter, newTTL)
+	})
 
-	// By locking the bucket and holding until return, we can ensure that the Set below is not subject to
-	// a race condition where
-	bucket.mu.Lock()
-	defer bucket.mu.Unlock()
-
-	ok, wait = bucket.update(float64(-n))
-
-	// Not enough tokens: limiter state unchanged
-	if !ok {
-		return
-	}
-
-	// Token acquired, limiter state mutated
-	// 'Set' to update ttl so bucket auto-expires when it will now become full
-	l.buckets.Set(key, bucket, time.Until(bucket.fullAt()))
 	return
+
 }
 
 // LocalLimiter is an in-memory token bucket that uses the same semantics as the redis-backed Limiter
 type LocalLimiter struct {
-	bucket *localTokenBucket
+	opts *LimiterOpts
+
+	mu             sync.Mutex
+	lastTokens     float64
+	lastAcquiredAt time.Time
 }
 
-func NewLocalLimiter(opts LimiterOpts) (*LocalLimiter, error) {
+func NewLocalLimiter(opts *LimiterOpts) (*LocalLimiter, error) {
 	err := opts.Sanitize()
 	if err != nil {
 		return nil, fmt.Errorf("opts: %w", err)
 	}
-	return &LocalLimiter{bucket: newLocalTokenBucket(opts.RatePerSec, opts.Capacity)}, nil
+	return &LocalLimiter{opts: opts, lastTokens: float64(opts.Capacity)}, nil
 }
 
 func (l *LocalLimiter) Replenish(ctx context.Context) error {
@@ -129,79 +123,58 @@ func (l *LocalLimiter) ReplenishN(ctx context.Context, n int) error {
 }
 
 func (l *LocalLimiter) AllowN(_ context.Context, n int) (ok bool, wait time.Duration, err error) {
-	if n > l.bucket.bucketCapacity {
-		err = fmt.Errorf("%w: n (%d) > capacity (%d)", ErrExceedsBucketCapacity, n, l.bucket.bucketCapacity)
+	return l.update(-n, nil)
+}
+
+func (l *LocalLimiter) update(
+	tokensDelta int,
+	onTTLChange func(newTTL time.Duration),
+) (ok bool, wait time.Duration, err error) {
+	if -tokensDelta > l.opts.Capacity {
+		err = fmt.Errorf("%w: tokensDelta (%d) > capacity (%d)", ErrExceedsBucketCapacity, tokensDelta, l.opts.Capacity)
 		return
 	}
 
-	l.bucket.mu.Lock()
-	defer l.bucket.mu.Unlock()
-	ok, wait = l.bucket.update(float64(-n))
-	return
-}
+	l.mu.Lock()
+	defer l.mu.Unlock()
 
-// localTokenBucket is designed to mimic the redis token bucket implemented in limiter_token_bucket.lua
-//
-// It's expected that the caller manages the lock, in order to allow update() + fullAt() to be invoked without
-// the possibility of interleaving.
-type localTokenBucket struct {
-	ratePerSec     float64
-	bucketCapacity int
-
-	mu             sync.Mutex
-	lastTokens     float64
-	lastAcquiredAt time.Time
-}
-
-func newLocalTokenBucket(ratePerSec float64, bucketCapacity int) *localTokenBucket {
-	return &localTokenBucket{
-		ratePerSec:     ratePerSec,
-		bucketCapacity: bucketCapacity,
-		lastTokens:     float64(bucketCapacity),
-	}
-}
-
-func (b *localTokenBucket) update(tokensDelta float64) (ok bool, wait time.Duration) {
 	now := time.Now()
 
 	// Calculate how many tokens the bucket would have after applying accrued tokens
 	// and the requested delta. Constrain to bucket capacity.
-	currentTokens := min(b.lastTokens+b.accruedTokens(now)+tokensDelta, float64(b.bucketCapacity))
+	var accruedTokens float64
+	if !l.lastAcquiredAt.IsZero() {
+		elapsed := max(0, now.Sub(l.lastAcquiredAt))
+		accruedTokens = l.opts.RatePerSec * elapsed.Seconds()
+	}
+
+	currentTokens := min(l.lastTokens+accruedTokens+float64(tokensDelta), float64(l.opts.Capacity))
 
 	// Acquisition would take tokens negative: not allowed
 	if currentTokens < 0 {
 		shortfall := 0 - currentTokens
-		waitSecs := shortfall / b.ratePerSec
+		waitSecs := shortfall / l.opts.RatePerSec
 		wait = time.Duration(waitSecs * float64(time.Second))
-		return false, wait
+		return
 	}
 
 	// Acquisition is successful
-	b.lastTokens = currentTokens
-	b.lastAcquiredAt = now
-	return true, 0
-}
+	l.lastTokens = currentTokens
+	l.lastAcquiredAt = now
 
-// Calculate how many tokens have accrued as a result of the passage of time
-func (b *localTokenBucket) accruedTokens(now time.Time) float64 {
-	if b.lastAcquiredAt.IsZero() {
-		return 0
+	// TODO: Simplify, can probably tidy up along with currentTokens calculation
+	if onTTLChange != nil {
+		var ttl time.Duration
+		tokensUntilFull := float64(l.opts.Capacity) - l.lastTokens - accruedTokens
+		if tokensUntilFull > 0 {
+			secsUntilFull := tokensUntilFull / l.opts.RatePerSec
+			ttl = time.Duration(secsUntilFull * float64(time.Second))
+		}
+		onTTLChange(ttl)
 	}
 
-	timeDeltaSecs := now.Sub(b.lastAcquiredAt).Seconds()
-	return timeDeltaSecs * b.ratePerSec
-}
+	ok = true
+	wait = 0
 
-// Calculate at what time the bucket will be completely full
-func (b *localTokenBucket) fullAt() time.Time {
-	now := time.Now()
-
-	tokensUntilFull := float64(b.bucketCapacity) - b.lastTokens - b.accruedTokens(now)
-	if tokensUntilFull <= 0 {
-		// Already full
-		return now
-	}
-
-	secsUntilFull := tokensUntilFull / b.ratePerSec
-	return now.Add(time.Duration(secsUntilFull * float64(time.Second)))
+	return
 }
