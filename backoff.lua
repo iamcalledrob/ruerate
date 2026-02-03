@@ -15,8 +15,8 @@ local max_penalty = {{ MAX_PENALTY }}
 local redis_time = redis.call("TIME")
 local now_micros = tonumber(redis_time[1]) * 1e6 + tonumber(redis_time[2])
 
--- Time can be injected for testing
-if ARGV[1] then
+-- Time can be injected for testing, specify a non-zero value
+if ARGV[1] and tonumber(ARGV[1]) ~= 0 then
     now_micros = tonumber(ARGV[1])
 end
 
