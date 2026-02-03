@@ -1,7 +1,6 @@
-package ruerate
+package backoff
 
 import (
-	"context"
 	"math"
 	"testing"
 	"time"
@@ -9,51 +8,49 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-type testableLimiter interface {
-	Allow(context.Context) (bool, time.Duration, error)
-	Reset(context.Context) error
-}
+// Common tests for a *Limiter
+// Reduces duplication but also ensures local+redis implementations act identically
+// Chore: Use this approach for TokenBucket limiter tests too
 
-// Common backoff tests
-func testBackoffLimiter_Common(
+func testLimiter_Common(
 	t *testing.T,
-	factory func(opts BackoffOpts) (testableLimiter, error),
+	factory func(opts LimiterOpts) (Limiter, error),
 ) {
 	t.Run("Allow", func(t *testing.T) {
-		testBackoffLimiter_Allow(t, factory)
+		testLimiter_Allow(t, factory)
 	})
 	t.Run("Reset", func(t *testing.T) {
-		testBackoffLimiter_Reset(t, factory)
+		testLimiter_Reset(t, factory)
 	})
 	t.Run("AllowBeforeLast", func(t *testing.T) {
-		testBackoffLimiter_AllowBeforeLast(t, factory)
+		testLimiter_AllowBeforeLast(t, factory)
 	})
 	t.Run("GrowthFactor", func(t *testing.T) {
-		testBackoffLimiter_GrowthFactor(t, factory)
+		testLimiter_GrowthFactor(t, factory)
 	})
 	t.Run("MaxWait", func(t *testing.T) {
-		testBackoffLimiter_MaxWait(t, factory)
+		testLimiter_MaxWait(t, factory)
 	})
 	t.Run("PrematureAttemptsDontGrow", func(t *testing.T) {
-		testBackoffLimiter_PrematureAttemptsDontGrow(t, factory)
+		testLimiter_PrematureAttemptsDontGrow(t, factory)
 	})
 	t.Run("WaitScalesWithDecay", func(t *testing.T) {
-		testBackoffLimiter_WaitScalesWithDecay(t, factory)
+		testLimiter_WaitScalesWithDecay(t, factory)
 	})
 	t.Run("WaitExceedsBaselineBeforeDecay", func(t *testing.T) {
-		testBackoffLimiter_WaitExceedsBaselineBeforeDecay(t, factory)
+		testLimiter_WaitExceedsBaselineBeforeDecay(t, factory)
 	})
 	t.Run("DecayScenario", func(t *testing.T) {
-		testBackoffLimiter_DecayScenario(t, factory)
+		testLimiter_DecayScenario(t, factory)
 	})
 }
 
-func testBackoffLimiter_Allow(
+func testLimiter_Allow(
 	t *testing.T,
-	factory func(opts BackoffOpts) (testableLimiter, error),
+	factory func(opts LimiterOpts) (Limiter, error),
 ) {
 	t.Run("NeverInitialized", func(t *testing.T) {
-		l, err := factory(BackoffOpts{})
+		l, err := factory(LimiterOpts{})
 		require.NoError(t, err)
 
 		var ok bool
@@ -66,7 +63,7 @@ func testBackoffLimiter_Allow(
 		require.Equal(t, time.Duration(0), wait)
 	})
 	t.Run("WithPenalty", func(t *testing.T) {
-		l, err := factory(BackoffOpts{})
+		l, err := factory(LimiterOpts{})
 		require.NoError(t, err)
 
 		// Incur penalty
@@ -86,7 +83,7 @@ func testBackoffLimiter_Allow(
 	})
 	t.Run("WithFullyDecayedPenalty", func(t *testing.T) {
 		decayTime := 100 * time.Millisecond
-		l, err := factory(BackoffOpts{
+		l, err := factory(LimiterOpts{
 			BaseWait:             50 * time.Millisecond,
 			PenaltyDecayInterval: decayTime,
 		})
@@ -112,13 +109,13 @@ func testBackoffLimiter_Allow(
 	})
 }
 
-func testBackoffLimiter_Reset(
+func testLimiter_Reset(
 	t *testing.T,
-	factory func(opts BackoffOpts) (testableLimiter, error),
+	factory func(opts LimiterOpts) (Limiter, error),
 ) {
 	// Ensure Reset does not fail even if the limiter has never been seen before
 	t.Run("NeverInitialized", func(t *testing.T) {
-		l, err := factory(BackoffOpts{})
+		l, err := factory(LimiterOpts{})
 		require.NoError(t, err)
 
 		err = l.Reset(t.Context())
@@ -129,7 +126,7 @@ func testBackoffLimiter_Reset(
 	// i.e. should be kept track of
 	t.Run("WithPenalty", func(t *testing.T) {
 		// Ensure penalty won't fully decay during test
-		l, err := factory(BackoffOpts{
+		l, err := factory(LimiterOpts{
 			PenaltyDecayInterval: 24 * time.Hour,
 		})
 		require.NoError(t, err)
@@ -161,7 +158,7 @@ func testBackoffLimiter_Reset(
 	// but it has fully decayed.
 	t.Run("WithFullyDecayedPenalty", func(t *testing.T) {
 		decayTime := 100 * time.Millisecond
-		l, err := factory(BackoffOpts{
+		l, err := factory(LimiterOpts{
 			BaseWait:             50 * time.Millisecond,
 			MaxWait:              75 * time.Millisecond,
 			PenaltyDecayInterval: decayTime,
@@ -195,11 +192,11 @@ func testBackoffLimiter_Reset(
 
 // Ensure any internal clock changes don't totally break stuff, e.g. by
 // applying negative penalties
-func testBackoffLimiter_AllowBeforeLast(
+func testLimiter_AllowBeforeLast(
 	t *testing.T,
-	factory func(opts BackoffOpts) (testableLimiter, error),
+	factory func(opts LimiterOpts) (Limiter, error),
 ) {
-	opts := BackoffOpts{
+	opts := LimiterOpts{
 		BaseWait: 500 * time.Millisecond,
 	}
 	l, err := factory(opts)
@@ -227,9 +224,9 @@ func testBackoffLimiter_AllowBeforeLast(
 
 // Ensures the base wait delay grows by the growthFactor
 // Inherent in this is that the first delay = unscaled BaseWait
-func testBackoffLimiter_GrowthFactor(
+func testLimiter_GrowthFactor(
 	t *testing.T,
-	factory func(opts BackoffOpts) (testableLimiter, error),
+	factory func(opts LimiterOpts) (Limiter, error),
 ) {
 	// Not a sentinel, but expires about 1 penalty point per lifetime of the universe
 	NoDecay := time.Duration(math.MaxInt64)
@@ -237,7 +234,7 @@ func testBackoffLimiter_GrowthFactor(
 	t.Run("Base1sFactor1.2", func(t *testing.T) {
 		want := []float64{1.0, 1.1, 1.21, 1.34, 1.47, 1.61, 1.77, 1.95, 2.14, 2.36}
 
-		l, err := factory(BackoffOpts{
+		l, err := factory(LimiterOpts{
 			BaseWait:             1 * time.Second,
 			PenaltyDecayInterval: NoDecay,
 			GrowthFactor:         1.1,
@@ -249,7 +246,7 @@ func testBackoffLimiter_GrowthFactor(
 	t.Run("Base1sFactor2", func(t *testing.T) {
 		want := []float64{1, 2, 4, 8, 16, 32, 64, 128, 256}
 
-		l, err := factory(BackoffOpts{
+		l, err := factory(LimiterOpts{
 			BaseWait:             1 * time.Second,
 			MaxWait:              99999 * time.Hour,
 			PenaltyDecayInterval: NoDecay,
@@ -264,7 +261,7 @@ func testBackoffLimiter_GrowthFactor(
 	t.Run("Base1sFactor3", func(t *testing.T) {
 		want := []float64{1, 3, 9, 27, 81, 243, 729, 2187, 6561}
 
-		l, err := factory(BackoffOpts{
+		l, err := factory(LimiterOpts{
 			BaseWait:             1 * time.Second,
 			MaxWait:              99999 * time.Hour,
 			PenaltyDecayInterval: NoDecay,
@@ -278,7 +275,7 @@ func testBackoffLimiter_GrowthFactor(
 	t.Run("Base0.25sFactor2", func(t *testing.T) {
 		want := []float64{0.25, 0.5, 1, 2, 4, 8, 16, 32, 64, 128}
 
-		l, err := factory(BackoffOpts{
+		l, err := factory(LimiterOpts{
 			BaseWait:             250 * time.Millisecond,
 			MaxWait:              99999 * time.Hour,
 			PenaltyDecayInterval: NoDecay,
@@ -292,7 +289,7 @@ func testBackoffLimiter_GrowthFactor(
 	t.Run("CappedByMaxWait", func(t *testing.T) {
 		want := []float64{1, 2, 4, 8, 16, 30, 30, 30, 30}
 
-		l, err := factory(BackoffOpts{
+		l, err := factory(LimiterOpts{
 			BaseWait:             1 * time.Second,
 			MaxWait:              30 * time.Second,
 			PenaltyDecayInterval: NoDecay,
@@ -308,12 +305,12 @@ func testBackoffLimiter_GrowthFactor(
 
 // Ensures that MaxWait is respected, and that PenaltyDecayInterval
 // does indeed determine the "memory" of the limiter.
-func testBackoffLimiter_MaxWait(
+func testLimiter_MaxWait(
 	t *testing.T,
-	factory func(opts BackoffOpts) (testableLimiter, error),
+	factory func(opts LimiterOpts) (Limiter, error),
 ) {
 	// Scenario outlined in comments for BackoffOpts
-	opts := BackoffOpts{
+	opts := LimiterOpts{
 		BaseWait:             time.Second,
 		MaxWait:              30 * time.Second,
 		PenaltyDecayInterval: 48 * time.Hour,
@@ -377,12 +374,13 @@ func testBackoffLimiter_MaxWait(
 //
 // Guards against timing-related bugs where the next attempt might be
 // made slightly too soon, and would lead to a spiral of ever-increasing
-// backoffs that could never succeed.
-func testBackoffLimiter_PrematureAttemptsDontGrow(
+// backoffs that could never succeed. Acting this way is a design
+// decision to err on the side of not allowing backoff spiralling.
+func testLimiter_PrematureAttemptsDontGrow(
 	t *testing.T,
-	factory func(opts BackoffOpts) (testableLimiter, error),
+	factory func(opts LimiterOpts) (Limiter, error),
 ) {
-	l, err := factory(BackoffOpts{})
+	l, err := factory(LimiterOpts{})
 	require.NoError(t, err)
 
 	now := time.Now()
@@ -415,12 +413,12 @@ func testBackoffLimiter_PrematureAttemptsDontGrow(
 
 // Ensures that the wait scales as the penalty decays, and does not remain
 // scaled when enough time has passed for the penalty to have decayed to 0
-func testBackoffLimiter_WaitScalesWithDecay(
+func testLimiter_WaitScalesWithDecay(
 	t *testing.T,
-	factory func(opts BackoffOpts) (testableLimiter, error),
+	factory func(opts LimiterOpts) (Limiter, error),
 ) {
 	decayTime := 10 * time.Second
-	l, err := factory(BackoffOpts{
+	l, err := factory(LimiterOpts{
 		BaseWait:             time.Second,
 		PenaltyDecayInterval: decayTime,
 	})
@@ -459,12 +457,12 @@ func testBackoffLimiter_WaitScalesWithDecay(
 
 // Ensures that the wait remains scaled if not enough time has passed
 // for penalty to have decayed to 0
-func testBackoffLimiter_WaitExceedsBaselineBeforeDecay(
+func testLimiter_WaitExceedsBaselineBeforeDecay(
 	t *testing.T,
-	factory func(opts BackoffOpts) (testableLimiter, error),
+	factory func(opts LimiterOpts) (Limiter, error),
 ) {
 	decayTime := 10 * time.Second
-	l, err := factory(BackoffOpts{
+	l, err := factory(LimiterOpts{
 		BaseWait:             time.Second,
 		PenaltyDecayInterval: decayTime,
 		GrowthFactor:         2,
@@ -507,11 +505,11 @@ func testBackoffLimiter_WaitExceedsBaselineBeforeDecay(
 
 // Ensures that the limiter behaves as expected for a fixed scenario,
 // to detect behaviour changes
-func testBackoffLimiter_DecayScenario(
+func testLimiter_DecayScenario(
 	t *testing.T,
-	factory func(opts BackoffOpts) (testableLimiter, error),
+	factory func(opts LimiterOpts) (Limiter, error),
 ) {
-	l, err := factory(BackoffOpts{
+	l, err := factory(LimiterOpts{
 		BaseWait:             500 * time.Millisecond,
 		MaxWait:              1795 * time.Second,
 		PenaltyDecayInterval: 30 * time.Minute,
@@ -563,7 +561,7 @@ func testBackoffLimiter_DecayScenario(
 	require.InDeltaSlice(t, want1, gotWaitSecs, 0.01)
 }
 
-func hammerLimiter(t *testing.T, now time.Time, l testableLimiter, n int) (results []float64, now2 time.Time) {
+func hammerLimiter(t *testing.T, now time.Time, l Limiter, n int) (results []float64, now2 time.Time) {
 	// Make N successful attempts to the limiter, waiting the required time
 	for i := 0; i < n*2; i++ {
 		ok, wait, err := l.Allow(withInjectedTime(t.Context(), now))

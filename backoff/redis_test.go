@@ -1,18 +1,17 @@
-package ruerate
+package backoff
 
 import (
-	"os"
 	"testing"
 	"time"
 
-	"github.com/redis/rueidis"
+	ruerate "github.com/iamcalledrob/ruebucket"
 	"github.com/stretchr/testify/require"
 )
 
-func TestRedisBackoffLimiter(t *testing.T) {
-	testBackoffLimiter_Common(t, func(opts BackoffOpts) (testableLimiter, error) {
-		return NewRedisBackoffLimiter(newTestRedisClient(t), RedisBackoffOpts{
-			BackoffOpts: opts,
+func TestRedisLimiter(t *testing.T) {
+	testLimiter_Common(t, func(opts LimiterOpts) (Limiter, error) {
+		return NewRedisBackoffLimiter(ruerate.NewTestRedisClient(t), RedisLimiterOpts{
+			LimiterOpts: opts,
 			RedisKey:    "limiter:test",
 		})
 	})
@@ -21,8 +20,8 @@ func TestRedisBackoffLimiter(t *testing.T) {
 	t.Run("RedisKeys", func(t *testing.T) {
 		const fixedKey = "KEY"
 
-		opts := RedisKeyedBackoffOpts{
-			BackoffOpts: BackoffOpts{
+		opts := RedisKeyedLimiterOpts{
+			LimiterOpts: LimiterOpts{
 				PenaltyDecayInterval: 1000 * time.Millisecond,
 			},
 			RedisKey: func(key string) string {
@@ -31,7 +30,7 @@ func TestRedisBackoffLimiter(t *testing.T) {
 			},
 		}
 
-		client := newTestRedisClient(t)
+		client := ruerate.NewTestRedisClient(t)
 		l, err := NewRedisKeyedBackoffLimiter(client, opts)
 		require.NoError(t, err)
 
@@ -77,23 +76,4 @@ func TestRedisBackoffLimiter(t *testing.T) {
 		require.InDelta(t, 1000*time.Millisecond, time.Duration(gotTtlMs)*time.Millisecond, float64(10*time.Millisecond))
 
 	})
-}
-
-func newTestRedisClient(t testing.TB) rueidis.Client {
-	addr := os.Getenv("TEST_REDIS_ADDR")
-	if addr == "" {
-		addr = "localhost:6379"
-	}
-
-	client, err := rueidis.NewClient(rueidis.ClientOption{
-		InitAddress: []string{addr},
-		SelectDB:    1, // don't clobber default db (0)
-	})
-	require.NoError(t, err)
-
-	// Erase the entire db to isolate tests from each other.
-	err = client.Do(t.Context(), client.B().Flushdb().Build()).Error()
-	require.NoError(t, err)
-
-	return client
 }

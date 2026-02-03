@@ -1,4 +1,4 @@
-package ruerate
+package backoff
 
 import (
 	"context"
@@ -10,13 +10,13 @@ import (
 	"github.com/jellydator/ttlcache/v3"
 )
 
-// LocalKeyedBackoffLimiter is designed to mimic the redis-powered RedisKeyedBackoffLimiter,
+// LocalKeyedLimiter is designed to mimic the redis-powered RedisKeyedLimiter,
 // but implements its algorithm locally in Go.
-type LocalKeyedBackoffLimiter struct {
-	limiters *ttlcache.Cache[string, *LocalBackoffLimiter]
+type LocalKeyedLimiter struct {
+	limiters *ttlcache.Cache[string, *LocalLimiter]
 }
 
-func NewLocalKeyedBackoffLimiter(opts BackoffOpts) (*LocalKeyedBackoffLimiter, error) {
+func NewLocalKeyedLimiter(opts LimiterOpts) (*LocalKeyedLimiter, error) {
 	// Pre-sanitize opts, guarantee that future instantiations won't fail
 	err := opts.Sanitize()
 	if err != nil {
@@ -26,11 +26,11 @@ func NewLocalKeyedBackoffLimiter(opts BackoffOpts) (*LocalKeyedBackoffLimiter, e
 	// Lazily create local limiters when needed
 	// Using suppressed (single flight) loader ensures that there is never more than one
 	// limiter instance per key.
-	singleFlightLoader := ttlcache.NewSuppressedLoader(ttlcache.LoaderFunc[string, *LocalBackoffLimiter](
+	singleFlightLoader := ttlcache.NewSuppressedLoader(ttlcache.LoaderFunc[string, *LocalLimiter](
 		func(
-			limiters *ttlcache.Cache[string, *LocalBackoffLimiter], key string,
-		) *ttlcache.Item[string, *LocalBackoffLimiter] {
-			l, lErr := NewLocalBackoffLimiter(&opts)
+			limiters *ttlcache.Cache[string, *LocalLimiter], key string,
+		) *ttlcache.Item[string, *LocalLimiter] {
+			l, lErr := NewLocalLimiter(&opts)
 			if lErr != nil {
 				panic("NewLocalBackoffLimiter failed with pre-sanitized opts: " + lErr.Error())
 			}
@@ -41,34 +41,34 @@ func NewLocalKeyedBackoffLimiter(opts BackoffOpts) (*LocalKeyedBackoffLimiter, e
 		},
 	), nil)
 
-	limiters := ttlcache.New[string, *LocalBackoffLimiter](
+	limiters := ttlcache.New[string, *LocalLimiter](
 		ttlcache.WithLoader(singleFlightLoader),
-		ttlcache.WithDisableTouchOnHit[string, *LocalBackoffLimiter](), // No ttl magic, only change explicitly
+		ttlcache.WithDisableTouchOnHit[string, *LocalLimiter](), // No ttl magic, only change explicitly
 	)
 
 	// Purge expired limiters to prevent memory leak
 	go limiters.Start()
 
-	return &LocalKeyedBackoffLimiter{limiters: limiters}, nil
+	return &LocalKeyedLimiter{limiters: limiters}, nil
 }
 
 // Stop stops automatically cleaning up the limiter map
-// Call when no longer using LocalKeyedBackoffLimiter to avoid a goroutine leak.
-func (l *LocalKeyedBackoffLimiter) Stop() {
+// Call when no longer using LocalKeyedLimiter to avoid a goroutine leak.
+func (l *LocalKeyedLimiter) Stop() {
 	l.limiters.Stop()
 }
 
-func (l *LocalKeyedBackoffLimiter) Reset(ctx context.Context, key string) error {
+func (l *LocalKeyedLimiter) Reset(ctx context.Context, key string) error {
 	// Deleting the limiter has the same effect as resetting it.
 	// A new, default one will be allocated when next needed.
 	l.limiters.Delete(key)
 	return nil
 }
 
-func (l *LocalKeyedBackoffLimiter) Allow(ctx context.Context, key string) (ok bool, wait time.Duration, err error) {
+func (l *LocalKeyedLimiter) Allow(ctx context.Context, key string) (ok bool, wait time.Duration, err error) {
 	entry := l.limiters.Get(key)
 
-	// TODO: Update LocalKeyedLimiter to do the same here rather than reaching in to grab mutex
+	// TODO: Update token bucket to do the same here rather than reaching in to grab mutex
 	limiter := entry.Value()
 	ok, wait = limiter.allow(ctx, func(newTTL time.Duration) {
 		l.limiters.Set(key, limiter, newTTL)
@@ -77,17 +77,17 @@ func (l *LocalKeyedBackoffLimiter) Allow(ctx context.Context, key string) (ok bo
 	return
 }
 
-// LocalBackoffLimiter implements a single in-memory backoff limiter, mimicking the
+// LocalLimiter implements a single in-memory backoff limiter, mimicking the
 // Redis-powered BackoffLimiter.
-type LocalBackoffLimiter struct {
-	opts *BackoffOpts
+type LocalLimiter struct {
+	opts *LimiterOpts
 
 	mu             sync.Mutex
 	penalty        float64
 	lastAcquiredAt time.Time
 }
 
-func NewLocalBackoffLimiter(opts *BackoffOpts) (*LocalBackoffLimiter, error) {
+func NewLocalLimiter(opts *LimiterOpts) (*LocalLimiter, error) {
 	// opts is pointer to allow common opts to be shared across multiple instances
 	// held in LocalKeyedBackoffLimiter
 	err := opts.Sanitize()
@@ -95,10 +95,10 @@ func NewLocalBackoffLimiter(opts *BackoffOpts) (*LocalBackoffLimiter, error) {
 		return nil, fmt.Errorf("opts: %w", err)
 	}
 
-	return &LocalBackoffLimiter{opts: opts}, nil
+	return &LocalLimiter{opts: opts}, nil
 }
 
-func (l *LocalBackoffLimiter) Reset(_ context.Context) error {
+func (l *LocalLimiter) Reset(_ context.Context) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -108,12 +108,12 @@ func (l *LocalBackoffLimiter) Reset(_ context.Context) error {
 	return nil
 }
 
-func (l *LocalBackoffLimiter) Allow(ctx context.Context) (ok bool, wait time.Duration, err error) {
+func (l *LocalLimiter) Allow(ctx context.Context) (ok bool, wait time.Duration, err error) {
 	ok, wait = l.allow(ctx, func(time.Duration) {})
 	return
 }
 
-func (l *LocalBackoffLimiter) allow(
+func (l *LocalLimiter) allow(
 	ctx context.Context,
 	onTTLChange func(newTTL time.Duration),
 ) (ok bool, wait time.Duration) {

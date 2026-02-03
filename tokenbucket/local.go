@@ -1,6 +1,7 @@
-package ruerate
+package tokenbucket
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
@@ -8,43 +9,10 @@ import (
 	"github.com/jellydator/ttlcache/v3"
 )
 
+// TODO: Merge localTokenBucket w/ LocalLimiter, and make LocalLimiter take *opts
+
 // Local token bucket limiters that match behaviour of the replenishable redis counterparts.
 // Implemented to make it easy to use shared (redis-backed) limiters together with local (in memory) limiters.
-
-// LocalLimiter is an in-memory token bucket that uses the same semantics as the redis-backed Limiter
-type LocalLimiter struct {
-	bucket *localTokenBucket
-}
-
-func NewLocalLimiter(ratePerSec float64, bucketCapacity int) *LocalLimiter {
-	return &LocalLimiter{bucket: newLocalTokenBucket(ratePerSec, bucketCapacity)}
-}
-
-func (l *LocalLimiter) Replenish() {
-	l.ReplenishN(1)
-}
-
-func (l *LocalLimiter) Allow() (ok bool, wait time.Duration) {
-	ok, wait, _ = l.AllowN(1)
-	return
-}
-
-func (l *LocalLimiter) ReplenishN(n int) {
-	_, _, _ = l.AllowN(-n)
-	return
-}
-
-func (l *LocalLimiter) AllowN(n int) (ok bool, wait time.Duration, err error) {
-	if n > l.bucket.bucketCapacity {
-		err = fmt.Errorf("%w: n (%d) > capacity (%d)", ErrExceedsBucketCapacity, n, l.bucket.bucketCapacity)
-		return
-	}
-
-	l.bucket.mu.Lock()
-	defer l.bucket.mu.Unlock()
-	ok, wait = l.bucket.update(float64(-n))
-	return
-}
 
 // LocalKeyedLimiter manages in-memory token buckets and uses the same semantics as the redis-backed
 // ReplenishableKeyedLimiter.
@@ -52,12 +20,16 @@ func (l *LocalLimiter) AllowN(n int) (ok bool, wait time.Duration, err error) {
 // As with redis KeyedLimiter, only non-full buckets are kept in memory, and a goroutine is automatically
 // started to purge expired buckets.
 type LocalKeyedLimiter struct {
-	ratePerSec     float64
-	bucketCapacity int
-	buckets        *ttlcache.Cache[string, *localTokenBucket]
+	opts    LimiterOpts
+	buckets *ttlcache.Cache[string, *localTokenBucket]
 }
 
-func NewLocalKeyedLimiter(ratePerSec float64, bucketCapacity int) *LocalKeyedLimiter {
+func NewLocalKeyedLimiter(opts LimiterOpts) (*LocalKeyedLimiter, error) {
+	err := opts.Sanitize()
+	if err != nil {
+		return nil, fmt.Errorf("opts: %w", err)
+	}
+
 	// Lazily create token buckets when needed
 	// Using suppressed (single flight) loader ensures that there is never more than one bucket instance
 	// per key.
@@ -65,7 +37,7 @@ func NewLocalKeyedLimiter(ratePerSec float64, bucketCapacity int) *LocalKeyedLim
 		func(
 			buckets *ttlcache.Cache[string, *localTokenBucket], key string,
 		) *ttlcache.Item[string, *localTokenBucket] {
-			bucket := newLocalTokenBucket(ratePerSec, bucketCapacity)
+			bucket := newLocalTokenBucket(opts.RatePerSec, opts.Capacity)
 			ttl := time.Until(bucket.fullAt())
 			return buckets.Set(key, bucket, ttl)
 		},
@@ -79,7 +51,7 @@ func NewLocalKeyedLimiter(ratePerSec float64, bucketCapacity int) *LocalKeyedLim
 	// Purge expired buckets to prevent memory leak
 	go buckets.Start()
 
-	return &LocalKeyedLimiter{ratePerSec: ratePerSec, bucketCapacity: bucketCapacity, buckets: buckets}
+	return &LocalKeyedLimiter{opts: opts, buckets: buckets}, nil
 }
 
 // Stop stops automatically cleaning up the limiter map
@@ -88,21 +60,22 @@ func (l *LocalKeyedLimiter) Stop() {
 	l.buckets.Stop()
 }
 
-func (l *LocalKeyedLimiter) Replenish(key string) {
-	l.ReplenishN(key, 1)
+func (l *LocalKeyedLimiter) Replenish(ctx context.Context, key string) error {
+	return l.ReplenishN(ctx, key, 1)
 }
 
-func (l *LocalKeyedLimiter) Allow(key string) (ok bool, wait time.Duration, err error) {
-	return l.AllowN(key, 1)
+func (l *LocalKeyedLimiter) Allow(ctx context.Context, key string) (ok bool, wait time.Duration, err error) {
+	return l.AllowN(ctx, key, 1)
 }
 
-func (l *LocalKeyedLimiter) ReplenishN(key string, n int) {
-	_, _, _ = l.AllowN(key, -n)
+func (l *LocalKeyedLimiter) ReplenishN(ctx context.Context, key string, n int) error {
+	_, _, err := l.AllowN(ctx, key, -n)
+	return err
 }
 
-func (l *LocalKeyedLimiter) AllowN(key string, n int) (ok bool, wait time.Duration, err error) {
-	if n > l.bucketCapacity {
-		err = fmt.Errorf("%w: n (%d) > capacity (%d)", ErrExceedsBucketCapacity, n, l.bucketCapacity)
+func (l *LocalKeyedLimiter) AllowN(_ context.Context, key string, n int) (ok bool, wait time.Duration, err error) {
+	if n > l.opts.Capacity {
+		err = fmt.Errorf("%w: n (%d) > capacity (%d)", ErrExceedsBucketCapacity, n, l.opts.Capacity)
 		return
 	}
 
@@ -125,6 +98,45 @@ func (l *LocalKeyedLimiter) AllowN(key string, n int) (ok bool, wait time.Durati
 	// Token acquired, limiter state mutated
 	// 'Set' to update ttl so bucket auto-expires when it will now become full
 	l.buckets.Set(key, bucket, time.Until(bucket.fullAt()))
+	return
+}
+
+// LocalLimiter is an in-memory token bucket that uses the same semantics as the redis-backed Limiter
+type LocalLimiter struct {
+	bucket *localTokenBucket
+}
+
+func NewLocalLimiter(opts LimiterOpts) (*LocalLimiter, error) {
+	err := opts.Sanitize()
+	if err != nil {
+		return nil, fmt.Errorf("opts: %w", err)
+	}
+	return &LocalLimiter{bucket: newLocalTokenBucket(opts.RatePerSec, opts.Capacity)}, nil
+}
+
+func (l *LocalLimiter) Replenish(ctx context.Context) error {
+	return l.ReplenishN(ctx, 1)
+}
+
+func (l *LocalLimiter) Allow(ctx context.Context) (ok bool, wait time.Duration, err error) {
+	ok, wait, err = l.AllowN(ctx, 1)
+	return
+}
+
+func (l *LocalLimiter) ReplenishN(ctx context.Context, n int) error {
+	_, _, err := l.AllowN(ctx, -n)
+	return err
+}
+
+func (l *LocalLimiter) AllowN(_ context.Context, n int) (ok bool, wait time.Duration, err error) {
+	if n > l.bucket.bucketCapacity {
+		err = fmt.Errorf("%w: n (%d) > capacity (%d)", ErrExceedsBucketCapacity, n, l.bucket.bucketCapacity)
+		return
+	}
+
+	l.bucket.mu.Lock()
+	defer l.bucket.mu.Unlock()
+	ok, wait = l.bucket.update(float64(-n))
 	return
 }
 

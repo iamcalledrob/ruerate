@@ -1,12 +1,13 @@
-package ruerate
+package backoff
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"time"
 )
 
-type BackoffOpts struct {
+type LimiterOpts struct {
 	// BaseWait is the initial delay used for the first back-off, which
 	// then gets increased by GrowthFactor as the backoff escalates.
 	//
@@ -58,10 +59,10 @@ type BackoffOpts struct {
 	maxPenalty float64
 }
 
-// Sanitize checks BackoffOpts fields and sets defaults.
+// Sanitize checks LimiterOpts fields and sets defaults.
 // It is strict about correctness of field values, optimising for clarity,
 // rejecting nonsensical configurations.
-func (o *BackoffOpts) Sanitize() error {
+func (o *LimiterOpts) Sanitize() error {
 	if o == nil {
 		return fmt.Errorf("BackoffOpts is nil")
 	}
@@ -106,4 +107,14 @@ func (o *BackoffOpts) Sanitize() error {
 func maxPenalty(maxWait time.Duration, baseWait time.Duration, growthFactor float64) float64 {
 	ratio := maxWait.Seconds() / baseWait.Seconds()
 	return math.Log(ratio)/math.Log(growthFactor) + 1
+}
+
+type Limiter interface {
+	Allow(ctx context.Context) (ok bool, wait time.Duration, err error)
+	Reset(ctx context.Context) error
+}
+
+type KeyedLimiter interface {
+	Allow(ctx context.Context, key string) (ok bool, wait time.Duration, err error)
+	Reset(ctx context.Context, key string) error
 }

@@ -1,4 +1,4 @@
-package ruerate
+package backoff
 
 import (
 	"context"
@@ -8,38 +8,42 @@ import (
 	"strings"
 	"time"
 
+	"github.com/iamcalledrob/ruebucket"
 	"github.com/redis/rueidis"
 )
 
-type RedisKeyedBackoffOpts struct {
-	BackoffOpts BackoffOpts
+type RedisKeyedLimiterOpts struct {
+	LimiterOpts LimiterOpts
 
 	// Redis is the Redis key where the limiter state score should be stored
-	// for a given limiter key, e.g. limiter:users_by_ip:{key}:penalty
+	// for a given limiter key, e.g. limiter:users_by_ip:{key}
 	RedisKey func(key string) string
 }
 
-func (o *RedisKeyedBackoffOpts) Sanitize() error {
+func (o *RedisKeyedLimiterOpts) Sanitize() error {
 	if o.RedisKey == nil {
 		return fmt.Errorf("RedisKey is required")
 	}
-	err := o.BackoffOpts.Sanitize()
+	err := o.LimiterOpts.Sanitize()
 	if err != nil {
 		return fmt.Errorf("BackoffOpts: %w", err)
 	}
 	return nil
 }
 
-type RedisKeyedBackoffLimiter struct {
+type RedisKeyedLimiter struct {
 	client rueidis.Client
-	opts   RedisKeyedBackoffOpts
+	opts   RedisKeyedLimiterOpts
 	script *rueidis.Lua
 }
 
+// NewRedisKeyedBackoffLimiter instantiates a new redis-backed keyed backoff limiter.
+// Errors returned will always relate to sanity of the provided opts.
+// It would be reasonable to panic on error, e.g. lo.Must()
 func NewRedisKeyedBackoffLimiter(
 	client rueidis.Client,
-	opts RedisKeyedBackoffOpts,
-) (*RedisKeyedBackoffLimiter, error) {
+	opts RedisKeyedLimiterOpts,
+) (*RedisKeyedLimiter, error) {
 	err := opts.Sanitize()
 	if err != nil {
 		return nil, fmt.Errorf("opts: %w", err)
@@ -47,15 +51,15 @@ func NewRedisKeyedBackoffLimiter(
 
 	// Opts don't change during limiter lifespan, more efficient to define as constants.
 	s := strings.NewReplacer(
-		"{{ BASE_WAIT_MICROS }}", strconv.FormatInt(opts.BackoffOpts.BaseWait.Microseconds(), 10),
-		"{{ MAX_WAIT_MICROS }}", strconv.FormatInt(opts.BackoffOpts.MaxWait.Microseconds(), 10),
-		"{{ PENALTY_DECAY_RATE }}", strconv.FormatFloat(Every(opts.BackoffOpts.PenaltyDecayInterval), 'f', -1, 64),
-		"{{ GROWTH_FACTOR }}", strconv.FormatFloat(opts.BackoffOpts.GrowthFactor, 'f', -1, 64),
-		"{{ MAX_PENALTY }}", strconv.FormatFloat(opts.BackoffOpts.maxPenalty, 'f', -1, 64),
+		"{{ BASE_WAIT_MICROS }}", strconv.FormatInt(opts.LimiterOpts.BaseWait.Microseconds(), 10),
+		"{{ MAX_WAIT_MICROS }}", strconv.FormatInt(opts.LimiterOpts.MaxWait.Microseconds(), 10),
+		"{{ PENALTY_DECAY_RATE }}", strconv.FormatFloat(ruerate.Every(opts.LimiterOpts.PenaltyDecayInterval), 'f', -1, 64),
+		"{{ GROWTH_FACTOR }}", strconv.FormatFloat(opts.LimiterOpts.GrowthFactor, 'f', -1, 64),
+		"{{ MAX_PENALTY }}", strconv.FormatFloat(opts.LimiterOpts.maxPenalty, 'f', -1, 64),
 	).Replace(luaBackoffScript)
 	lua := rueidis.NewLuaScript(s)
 
-	return &RedisKeyedBackoffLimiter{
+	return &RedisKeyedLimiter{
 		client: client,
 		opts:   opts,
 		script: lua,
@@ -63,21 +67,21 @@ func NewRedisKeyedBackoffLimiter(
 }
 
 // NewRedisKeyedBackoffLimiterWithDefaultKey is a convenience initializer for a
-// RedisKeyedBackoffLimiter that writes to Redis key: "limiter:ID:{KEY}"
+// RedisKeyedLimiter that writes to Redis key: "limiter:ID:{KEY}"
 func NewRedisKeyedBackoffLimiterWithDefaultKey(
 	client rueidis.Client,
 	id string,
-	opts BackoffOpts,
-) (*RedisKeyedBackoffLimiter, error) {
-	return NewRedisKeyedBackoffLimiter(client, RedisKeyedBackoffOpts{
-		BackoffOpts: opts,
+	opts LimiterOpts,
+) (*RedisKeyedLimiter, error) {
+	return NewRedisKeyedBackoffLimiter(client, RedisKeyedLimiterOpts{
+		LimiterOpts: opts,
 		RedisKey: func(key string) string {
 			return "limiter:" + id + ":{" + key + "}"
 		},
 	})
 }
 
-func (l *RedisKeyedBackoffLimiter) Reset(ctx context.Context, key string) error {
+func (l *RedisKeyedLimiter) Reset(ctx context.Context, key string) error {
 	// Deleting keys reverts the limiter to its default state
 	cmd := l.client.B().Del().
 		Key(l.opts.RedisKey(key)).
@@ -85,7 +89,7 @@ func (l *RedisKeyedBackoffLimiter) Reset(ctx context.Context, key string) error 
 	return l.client.Do(ctx, cmd).Error()
 }
 
-func (l *RedisKeyedBackoffLimiter) Allow(ctx context.Context, key string) (ok bool, wait time.Duration, err error) {
+func (l *RedisKeyedLimiter) Allow(ctx context.Context, key string) (ok bool, wait time.Duration, err error) {
 	keys := []string{
 		l.opts.RedisKey(key), // lua: state_key
 	}
@@ -129,20 +133,19 @@ func (l *RedisKeyedBackoffLimiter) Allow(ctx context.Context, key string) (ok bo
 	return
 }
 
-type RedisBackoffOpts struct {
-	BackoffOpts BackoffOpts
+type RedisLimiterOpts struct {
+	LimiterOpts LimiterOpts
 
 	// RedisKey is the Redis key where the limiter state should be stored,
 	// e.g. limiter:{my_global_action}
 	RedisKey string
 }
 
-func (o *RedisBackoffOpts) Sanitize() error {
+func (o *RedisLimiterOpts) Sanitize() error {
 	if o.RedisKey == "" {
 		return fmt.Errorf("RedisKey is required")
 	}
-
-	err := o.BackoffOpts.Sanitize()
+	err := o.LimiterOpts.Sanitize()
 	if err != nil {
 		return fmt.Errorf("BackoffOpts: %w", err)
 	}
@@ -151,16 +154,16 @@ func (o *RedisBackoffOpts) Sanitize() error {
 
 func NewRedisBackoffLimiter(
 	client rueidis.Client,
-	opts RedisBackoffOpts,
-) (*RedisBackoffLimiter, error) {
+	opts RedisLimiterOpts,
+) (*RedisLimiter, error) {
 	err := opts.Sanitize()
 	if err != nil {
 		return nil, fmt.Errorf("opts: %w", err)
 	}
 
-	var l *RedisKeyedBackoffLimiter
-	l, err = NewRedisKeyedBackoffLimiter(client, RedisKeyedBackoffOpts{
-		BackoffOpts: opts.BackoffOpts,
+	var l *RedisKeyedLimiter
+	l, err = NewRedisKeyedBackoffLimiter(client, RedisKeyedLimiterOpts{
+		LimiterOpts: opts.LimiterOpts,
 		RedisKey: func(_ string) string {
 			return opts.RedisKey
 		},
@@ -169,34 +172,32 @@ func NewRedisBackoffLimiter(
 		return nil, fmt.Errorf("instantiating underlying keyed limiter: %w", err)
 	}
 
-	return &RedisBackoffLimiter{source: l}, nil
+	return &RedisLimiter{source: l}, nil
 }
 
-// NewBackoffLimiterWithDefaultKeys is a convenience initializer for an
-// unkeyed BackoffLimiter that writes to Redis keys:
-// - limiter:{ID}:penalty
-// - limiter:{ID}:last_acquired_at
-func NewBackoffLimiterWithDefaultKeys(
+// NewRedisLimiterWithDefaultKeys is a convenience initializer for an
+// unkeyed BackoffLimiter that writes to Redis key "limiter:{ID}"
+func NewRedisLimiterWithDefaultKeys(
 	client rueidis.Client,
 	id string,
-	opts BackoffOpts,
-) (*RedisBackoffLimiter, error) {
-	return NewRedisBackoffLimiter(client, RedisBackoffOpts{
-		BackoffOpts: opts,
+	opts LimiterOpts,
+) (*RedisLimiter, error) {
+	return NewRedisBackoffLimiter(client, RedisLimiterOpts{
+		LimiterOpts: opts,
 		RedisKey:    "limiter:{" + id + "}",
 	})
 }
 
-// RedisBackoffLimiter wraps a RedisKeyedBackoffLimiter and limits to a single key
-type RedisBackoffLimiter struct {
-	source *RedisKeyedBackoffLimiter
+// RedisLimiter wraps a RedisKeyedLimiter and limits to a single key
+type RedisLimiter struct {
+	source *RedisKeyedLimiter
 }
 
-func (l *RedisBackoffLimiter) Reset(ctx context.Context) error {
+func (l *RedisLimiter) Reset(ctx context.Context) error {
 	return l.source.Reset(ctx, "")
 }
 
-func (l *RedisBackoffLimiter) Allow(ctx context.Context) (ok bool, wait time.Duration, err error) {
+func (l *RedisLimiter) Allow(ctx context.Context) (ok bool, wait time.Duration, err error) {
 	return l.source.Allow(ctx, "")
 }
 

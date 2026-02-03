@@ -1,4 +1,4 @@
-package ruerate
+package backoff
 
 import (
 	"context"
@@ -9,15 +9,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestLocalBackoffLimiter(t *testing.T) {
-	testBackoffLimiter_Common(t, func(opts BackoffOpts) (testableLimiter, error) {
-		return NewLocalBackoffLimiter(&opts)
+func TestLocalLimiter(t *testing.T) {
+	testLimiter_Common(t, func(opts LimiterOpts) (Limiter, error) {
+		return NewLocalLimiter(&opts)
 	})
 }
 
-func TestLocalKeyedBackoffLimiter(t *testing.T) {
-	testBackoffLimiter_Common(t, func(opts BackoffOpts) (testableLimiter, error) {
-		kl, err := NewLocalKeyedBackoffLimiter(opts)
+func TestLocalKeyedLimiter(t *testing.T) {
+	testLimiter_Common(t, func(opts LimiterOpts) (Limiter, error) {
+		kl, err := NewLocalKeyedLimiter(opts)
 		if err != nil {
 			return nil, fmt.Errorf("instantiating local keyed backoff limiter: %w", err)
 		}
@@ -29,7 +29,7 @@ func TestLocalKeyedBackoffLimiter(t *testing.T) {
 
 		// Ensure cache properly expires items when penalty has fully decayed
 		t.Run("PenaltyDecay", func(t *testing.T) {
-			kl, err := NewLocalKeyedBackoffLimiter(BackoffOpts{
+			kl, err := NewLocalKeyedLimiter(LimiterOpts{
 				BaseWait:             100 * time.Millisecond,
 				PenaltyDecayInterval: 100 * time.Millisecond,
 			})
@@ -57,7 +57,7 @@ func TestLocalKeyedBackoffLimiter(t *testing.T) {
 
 		// Ensure cache properly expires items when reset is invoked
 		t.Run("Reset", func(t *testing.T) {
-			kl, err := NewLocalKeyedBackoffLimiter(BackoffOpts{
+			kl, err := NewLocalKeyedLimiter(LimiterOpts{
 				BaseWait:             100 * time.Millisecond,
 				PenaltyDecayInterval: 100 * time.Millisecond,
 			})
@@ -77,13 +77,11 @@ func TestLocalKeyedBackoffLimiter(t *testing.T) {
 			require.False(t, exists)
 		})
 	})
-
-	// TODO: Visualize scenario with a min reconnect interval. If not as a test, then just as a util func.
 }
 
 // Shim to allow testing of a local keyed limiter as a regular limiter
 type singleKeyLocalBackoffLimiter struct {
-	source *LocalKeyedBackoffLimiter
+	source *LocalKeyedLimiter
 }
 
 func (l *singleKeyLocalBackoffLimiter) Reset(ctx context.Context) error {
