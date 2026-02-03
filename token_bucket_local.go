@@ -1,4 +1,4 @@
-package ruebucket
+package ruerate
 
 import (
 	"fmt"
