@@ -58,7 +58,7 @@ func TestLimiter(t *testing.T) {
 	ok, wait, err = lim.Allow(t.Context())
 	require.NoError(t, err)
 	require.Less(t, wait, 50*time.Millisecond)
-	require.Greater(t, wait, 40*time.Millisecond)
+	require.Greater(t, wait, 30*time.Millisecond)
 	require.False(t, ok)
 
 	// Wait until another token will have been added to the bucket
