@@ -16,6 +16,9 @@ local state = redis.call("HMGET", state_key, "t", "la")
 local last_tokens = tonumber(state[1] or bucket_capacity)
 local last_acquired_at_micros = tonumber(state[2] or now_micros)
 
+-- Constrain integers to max supported value, prevent runtime error
+local int_max = 9007199254740991
+
 -- Convert rate to per-microsecond
 local rate_per_micro = rate_per_sec / 1e6
 
@@ -25,15 +28,20 @@ local accrued_tokens = delta_micros * rate_per_micro
 
 -- Calculate how many tokens the bucket would have after applying accrued tokens
 -- and the requested delta. Constrain to bucket capacity.
-local current_tokens = math.min(last_tokens + accrued_tokens + tokens_delta, bucket_capacity)
+local current_tokens = math.min(
+        last_tokens + accrued_tokens + tokens_delta,
+        bucket_capacity
+)
 
 -- Acquisition would take tokens negative: not allowed
 if current_tokens < 0 then
     -- Calculate wait until acquisition could be possible
     local shortfall = 0 - current_tokens
     local wait_micros = math.ceil(shortfall / rate_per_micro)
+
     -- Result: {Not Allowed, Wait wait_micros}
-    return {0, wait_micros}
+    -- Don't allow int to overflow when received by Redis
+    return {0, math.min(wait_micros, int_max)}
 end
 
 -- Allowed: Calculate space left in the bucket
@@ -45,7 +53,11 @@ if tokens_until_full <= 0 then
 else
     -- Auto-expire key at time it would become full.
     -- A missing key is treated as a full bucket.
-    local time_until_full_millis = math.ceil(tokens_until_full / (rate_per_sec / 1000))
+    -- Don't allow int to overflow when received by Redis
+    local time_until_full_millis = math.min(
+        math.ceil(tokens_until_full / (rate_per_sec / 1000)),
+        int_max
+    )
 
     -- Persist state in a single key
     -- Merge into single HSETEX call once support is more common

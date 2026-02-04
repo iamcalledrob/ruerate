@@ -100,6 +100,10 @@ func TestRedisLimiter(t *testing.T) {
 		require.EqualValues(t, 1, lim.cacheHits.Load())
 		require.EqualValues(t, 2, lim.cacheMisses.Load())
 
+		// Ensure there is actually a value in the cache
+		_, ok = lim.waitCache.Shard("key1").GetValue("key1")
+		require.True(t, ok)
+
 		// Ensure that after "wait", it's possible to allow for the same key
 		<-time.After(wait)
 		ok, wait, err = lim.Allow(t.Context(), "key1")
@@ -113,7 +117,8 @@ func TestRedisLimiter(t *testing.T) {
 		require.EqualValues(t, 3, lim.cacheMisses.Load())
 
 		// Ensure the entry in the wait cache has been cleaned up
-		require.False(t, lim.waitCache.Has("key1"))
+		_, ok = lim.waitCache.Shard("key1").GetValue("key1")
+		require.False(t, ok)
 	})
 }
 

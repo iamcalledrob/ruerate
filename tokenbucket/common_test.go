@@ -1,12 +1,16 @@
 package tokenbucket
 
 import (
+	"math"
 	"testing"
 	"time"
 
 	ruerate "github.com/iamcalledrob/ruebucket"
 	"github.com/stretchr/testify/require"
 )
+
+// Currently, tokenbucket tests only use the real clock, and don't inject time
+// Future improvement: use injected time, as with backoff limiter.
 
 func testLimiter_Common(
 	t *testing.T,
@@ -25,6 +29,9 @@ func testLimiter_Common(
 	})
 	t.Run("Replenish", func(t *testing.T) {
 		testLimiter_Replenish(t, factory)
+	})
+	t.Run("Overflows", func(t *testing.T) {
+		testLimiter_Overflows(t, factory)
 	})
 }
 
@@ -157,6 +164,36 @@ func testLimiter_Replenish(
 	require.NoError(t, err)
 	require.Zero(t, wait)
 	require.True(t, ok)
+}
+
+func testLimiter_Overflows(
+	t *testing.T,
+	factory func(opts LimiterOpts) (Limiter, error),
+) {
+	lim, err := factory(LimiterOpts{
+		RatePerSec: math.SmallestNonzeroFloat64,
+		Capacity:   math.MaxInt,
+	})
+	require.NoError(t, err)
+
+	// Almost exhaust the limiter
+	ok, wait, err := lim.AllowN(t.Context(), math.MaxInt-100)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	// Actually exhaust the limiter
+	// 2 steps so both the zero and non-zero states are considered
+	// There will be some internal precision loss at these scales
+	ok, wait, err = lim.AllowN(t.Context(), 1000)
+	require.NoError(t, err)
+	require.False(t, ok)
+
+	// Ensure wait has not wrapped around to be negative
+	require.Greater(t, wait, time.Duration(0))
+
+	// Sanity check: ensure the wait is really, really big.
+	// Checks for 100 years, but will be more like heat death of the universe.
+	require.Greater(t, wait, 100*365*24*time.Hour)
 }
 
 func testKeyedLimiter_DistinctKeys(

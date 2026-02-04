@@ -10,7 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/jellydator/ttlcache/v3"
+	"github.com/iamcalledrob/ruebucket/internal/ttlmap"
 	"github.com/redis/rueidis"
 )
 
@@ -20,6 +20,11 @@ type RedisKeyedLimiterOpts struct {
 	// RedisKey is the Redis key where the limiter state score should be stored
 	// for a given limiter key, e.g. limiter:users_by_ip:{key}
 	RedisKey func(key string) string
+
+	// CacheLockShards bounds the number of concurrent Redis calls that can be
+	// made when using RedisCacheableKeyedLimiter. Must be a power of 2.
+	// Defaults to 1024
+	CacheLockShards uint16
 }
 
 func (o *RedisKeyedLimiterOpts) Sanitize() error {
@@ -140,7 +145,9 @@ func (l *RedisKeyedLimiter) AllowN(ctx context.Context, key string, n int) (ok b
 // token will be available. The limiter won't make further round-trips to redis until the wait time has elapsed.
 type RedisCacheableKeyedLimiter struct {
 	replenishable *RedisKeyedLimiter
-	waitCache     *ttlcache.Cache[string, struct{}]
+
+	waitCache *ttlmap.Map[string, struct{}]
+	//waitCache     *ttlcache.Cache[string, struct{}]
 
 	// Currently just for tests
 	cacheHits   atomic.Int64
@@ -155,12 +162,11 @@ func NewRedisCacheableKeyedLimiter(client rueidis.Client, opts RedisKeyedLimiter
 		return nil, err
 	}
 
-	// waitCache uses ttlcache as a self-cleaning map of [string]time.Time, by stuffing an empty struct into
-	// the map value and treating the TTL/key expiry as the real value.
+	// waitCache uses ttlmap as a self-cleaning map of [string]time.Time, by stuffing an
+	// empty struct into the map value and treating the TTL/key expiry as the real value.
 	//
-	// keys stay in the map up until their ttl expires.
-	waitCache := ttlcache.New(ttlcache.WithDisableTouchOnHit[string, struct{}]())
-	go waitCache.Start()
+	// keys stay in the map until their ttl expires.
+	waitCache := ttlmap.New[string, struct{}]()
 
 	return &RedisCacheableKeyedLimiter{
 		replenishable: rl,
@@ -168,18 +174,25 @@ func NewRedisCacheableKeyedLimiter(client rueidis.Client, opts RedisKeyedLimiter
 	}, nil
 }
 
-// Stop stops automatically cleaning up the internal wait cache
-// Call when no longer using KeyedLimiter to avoid a goroutine leak.
-func (l *RedisCacheableKeyedLimiter) Stop() {
-	l.waitCache.Stop()
-}
-
 func (l *RedisCacheableKeyedLimiter) Allow(ctx context.Context, key string) (ok bool, wait time.Duration, err error) {
-	cacheEntry := l.waitCache.Get(key)
+	shard := l.waitCache.Shard(key)
 
-	if cacheEntry != nil && time.Now().Before(cacheEntry.ExpiresAt()) {
+	// Design note: Shard is locked when reading and writing from the waitCache,
+	// for memory safety, but it is unlocked during the actual Redis call.
+	//
+	// This introduces a chance that the cache is not used when concurrent
+	// calls are made and the key's bucket is 1 call away from depletion.
+	//
+	// The alternative, locking the shard during the op, would eliminate the
+	// possibility of concurrent redis calls at the (bigger) cost of
+	// serializing all calls to the limiter for all keys in the shard.
+	shard.Lock()
+	_, cachedExpiry, cached := shard.Get(key)
+	shard.Unlock()
+
+	if cached && time.Now().Before(cachedExpiry) {
 		l.cacheHits.Add(1)
-		wait = time.Until(cacheEntry.ExpiresAt())
+		wait = time.Until(cachedExpiry)
 		return
 	}
 
@@ -191,7 +204,12 @@ func (l *RedisCacheableKeyedLimiter) Allow(ctx context.Context, key string) (ok 
 	}
 
 	if !ok {
-		l.waitCache.Set(key, struct{}{}, wait)
+		// Unlike Local variant, Redis returns a ttl (not an expiry time),
+		// as the Redis server time is out of sync.
+		expiresAt := time.Now().Add(wait)
+		shard.Lock()
+		shard.Set(key, struct{}{}, expiresAt)
+		shard.Unlock()
 		return
 	}
 
@@ -305,6 +323,8 @@ func NewRedisCacheableLimiterWithDefaultKey(
 	id string,
 	opts LimiterOpts,
 ) (*RedisCacheableLimiter, error) {
+	// Currently uses the default number of ttlmap shards (32?) even though there's
+	// only one key. Unlikely to be a big deal, but could be improved.
 	return NewRedisCacheableLimiter(client, RedisLimiterOpts{
 		LimiterOpts: opts,
 		RedisKey:    "limiter:{" + id + "}",
