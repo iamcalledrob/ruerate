@@ -1,133 +1,218 @@
-# ruebucket
-ruebucket implements a redis-backed rate limiter using a **token bucket** algorithm.
-Built on top of https://github.com/redis/rueidis, with auto-pipelining.
+# ruerate
+ruelimit implements high-performance rate limiting algorithms with both in-memory Golang and distributed Redis implementations.
 
-[Godoc](https://pkg.go.dev/github.com/iamcalledrob/ruebucket)
+Distributed variants built on top of [redis/rueidis](https://github.com/redis/rueidis) with auto-pipelining.
+The in-memory variants use a sharded lockable map.
+
+[Godoc](https://pkg.go.dev/github.com/iamcalledrob/ruerate)
+
 
 ## Features
-1. **Minimal resource usage:** When a bucket is full, no data is stored in Redis (default full design).
-   Keys expire as soon as possible.
-2. **Keyed limiters**: Supports applying limits per-identifier -- e.g. http requests by IP.
-3. **Replenishable**: Tokens can be added back to the bucket on-demand.
-4. **Local implementation**: A local (non redis) implementation of the same algorithm is provided for convenience.  
-5. **Minimized round-trips to Redis**: Avoids constantly pinging Redis when a limiter is known to be exhausted.
-   Handy for very hot paths.
+1. **Zero memory default**: Only limiters out of their default state use memory. Automatic cleanup via TTLs.
+2. **Keyed limiters**: Apply limits per-identifier (e.g. http requests by IP)
+3. **Replenishable**: Manually add tokens back to the bucket on-demand (token bucket algorithm)
+4. **Local caching**: `RedisCacheable*` variants avoid round-trips when a limiter is known to be exhausted
+5. **Very low allocation**: Most paths are zero-alloc, others are 1 alloc.
 
-## Goals
-1. Be familiar to users of `golang.org/x/time/rate.Limiter`
-2. Simple API, easy to use.
-3. Be self-cleaning - no memory leaks, especially for keyed limiters.
+# Usage
 
-## Usage
-There are a few types available depending on requirements:
+## Token Bucket Algorithm
+Use-cases: API rate limiting, protecting from traffic spikes, and scenarios requiring a steady flow of requests
+with occasional bursts.
 
-### KeyedLimiter
-`KeyedLimiter` is a non-replenishable limiter that caches wait durations to avoid unnecessary redis calls
--- good for use on very hot paths where limiters will often be exhausted.
+### Implementations:
+- tokenbucket.LocalLimiter: Single-resource in-memory limiter.
+- tokenbucket.LocalKeyedLimiter: Per-key in-memory limiter.
+- tokenbucket.RedisLimiter: Distributed, replenishable single-resource limiter.
+- tokenbucket.RedisKeyedLimiter: Distributed, replenishable per-key limiter.
+- tokenbucket.RedisCacheableLimiter: More efficient version of `RedisLimiter` with client-side caching.
+- tokenbucket.RedisCacheableKeyedLimiter: More efficient version of `RedisKeyedLimiter` with client-side caching.
 
-If an earlier call to Allow was unsuccessful due to an empty bucket, KeyedLimiter returns the wait time until
-the next token will be available. The limiter caches this wait time, and won't make further round-trips to
-redis until the wait time has elapsed.
-
-This is the fastest limiter, and should be used unless replenishment is needed.
-
-```go
-// Allow 1 HTTP request per IP every second, with a burst of up to 100.
-lim := ruebucket.NewKeyedLimiter(
-    rueidisClient,
-    "http_requests_by_ip",                // limiter identifier
-    ruebucket.AllowEvery(time.Second),    // bucket replenishment rate
-    100,                                  // bucket capacity (initially full)
-)
+### Configuration
+The `tokenbucket.LimiterOpts` struct defines the bucket behavior:
+```
+type LimiterOpts struct {
+    RatePerSec float64 // How many tokens are added to the bucket per second
+    Capacity   int64   // Maximum tokens the bucket can hold
+}
 ```
 
-```go
+### Example
+```golang
+// Scenario: Allow 1 HTTP request per IP every second, with a burst of up to 100.
+//
+// Use distributed, Redis-backed variant so limits apply across frontend server pool.
+lim, _ := tokenbucket.RedisCacheableKeyedLimiter(
+    rueidisClient,
+    tokenbucket.DefaultRedisKeyedLimiterOpts(
+        "http_requests_by_ip", // limiter name, used to derive Redis key
+        LimiterOpts{
+            RatePerSec: ruerate.Every(time.Second), 
+            Capacity: 100,
+        }
+    )
+)
+
 // Check if this IP is allowed to make another HTTP request
-ok, wait, err := lim.Allow(context.Background(), "10.0.0.1")
-if err != nil {
-    // Failed to communicate with Redis
-}
+ok, wait, _ := lim.Allow(context.TODO(), "10.0.0.1")
+
 if !ok {
     // Not allowed -- no tokens left in the bucket
     // Next token available after 'wait'
     w.WriteHeader(http.StatusTooManyRequests)
+    // You probably want to apply jitter. This will add rand(0-50%) jitter.
+    wait = ruerate.WithJitter(wait, 0.5)
     w.Header().Set("X-RateLimit-Remaining-Ms", strconv.FormatInt(wait.Milliseconds(), 10))
 }
 
 // Handle the request...
 ```
 
-### Limiter
-Limiter works just like `KeyedLimiter`, but limits a single default key.
 
-```go
-// Allow 1 signup every 5s, with a burst of up to 10.
-signupsLimiter := ruebucket.NewLimiter(
-    rueidisClient,
-    "signups",                                // limiter identifier
-    ruebucket.AllowEvery(5 * time.Second),    // bucket replenishment rate
-    10,                                       // bucket capacity (initially full)
+## Exponential Backoff, Linear Decay Algorithm
+Use-cases: Jailing spammy clients, slowing down brute-force login attempts, or building polite client-side reconnection
+loops, i.e. with the local in-memory variants.
+
+### Implementations:
+- `backoff.LocalLimiter`: Single resource in-memory backoff limiter
+- `backoff.LocalKeyedLimiter`: Per-key in-memory backoff limiter
+- `backoff.RedisLimiter`: Distributed, single resource backoff limiter
+- `backoff.RedisKeyedLimiter`: Distributed, per-key backoff limiter
+
+### Example (server)
+```golang
+// Scenario: Game server should punish overly frequent reconnections, based on UserID.
+// Users shouldn't be reconnecting more often than once per 30 mins (in the long run)
+// Be tolerant to occasional reconnects, but quickly ramp "punishment" for too many.
+lim, _ := backoff.NewLocalKeyedLimiter(
+    backoff.LimiterOpts{
+        // Minimum wait of 5s between attempts. Wait grows from here.
+        BaseWait: 5 * time.Second,
+		
+        // Users can be "locked out" for a maximum of 300s
+        MaxWait: 300 * time.Second,
+		
+        // Prior attempts take 30m to be forgotten (linear decay)
+        PenaltyDecayInterval: 30 * time.Minute,
+        
+        // Wait doubles each time, e.g. 5s, 10s, 20s, 40s, 1m20s, 2m40s etc. (up to MaxWait cap)
+        GrowthFactor: 2.0,
+    }
 )
-```
 
-```go
-ok, wait, err := signupsLimiter.Allow(context.Background())
-if err != nil {
-    // Failed to communicate with Redis
-}
+// Check if this user is allowed to connect right now
+ok, wait, _ := lim.Allow(context.TODO(), "timapple")
 if !ok {
-    // Not allowed -- no tokens left in the bucket
-    // Next token available after 'wait'
+    // Logic to reject connection, probably applying jitter to wait...
 }
 
-// Allow signup
 ```
 
-### ReplenishableKeyedLimiter
-`ReplenishableKeyedLimiter` is a redis-backed token bucket rate limiter that supports attempting to take tokens
-from the bucket AND replenishing tokens back into the bucket.
+### Example (client)
+```golang
+// Scenario: Apply back-off when connecting to a server.
+// Start at 1s between attempts, and double each time until 32s between attempts.
+// Remember failed attempts for 60s, will "cool down" back to 1s after about 5 minutes.
+lim, _ := backoff.NewLocalLimiter(
+    backoff.LimiterOpts{
+        BaseWait: time.Second,
+        MaxWait: 32 * time.Second,
+        PenaltyDecayInterval: 60 * time.Second,
+        GrowthFactor: 2.0,
+    }
+})
 
-The limiter is identified by "id", and Allow/Replenish take a key used to identify an individual resource.
-This allows a single limiter instance to limit multiple an action for multiple different actors,
-e.g. limiting a common action (id: api_endpoint) on a per-actor basis (key: ip_address).
-
-**Support for replenishing comes at the cost of increased Redis calls** -- since the number of tokens in a bucket can
-change by more than just time, the client can't cache the wait until the next token will become available, and instead
-has to ask Redis each time.
-
-```go
-// Manually replenish the bucket with a token
-lim.Replenish(context.Background(), "10.0.0.1")
+// Connection loop sketch
+// Will wait 1s, 2s, 4s, 8s, 16s, 32s, 32s, 32s (-decay)
+func DialServerWithBackoff(ctx context.Context, lim *LocalBackoffLimiter) error {
+retry:
+    ok, wait, _ := lim.Allow(ctx)
+    if !ok {
+        select {
+        case <-time.After(wait):
+            goto retry
+        case <-ctx.Done():
+            return fmt.Errorf("while waiting: %w", err)
+        }	
+    }
+	
+    err := server.Dial(ctx)
+	if errors.Is(err, ErrServerUnreachable) {
+        goto retry
+    }
+	
+    return err
+}
 ```
 
-### ReplenishableLimiter
-`ReplenishableLimiter` to `ReplenishableKeyedLimiter` is what `Limiter` is to `KeyedLimiter`.
+## Performance
+Redis variants are designed to use as little Redis keyspace and storage as possible, and reduce round-trips where
+possible, via `RedisCacheable*` variants. These limiters are designed for use in hot paths in production.
 
-### LocalKeyedLimiter / LocalLimiter
-These limiters work in exactly the same way, using the same algorithm as their non-local Redis counterparts.
-They exist for convenience. The only difference between the Local and Redis APIs is the lack of a `context` parameter.
+By using rueidis auto-pipelining, exceptional throughput is possible, and the simple atomic design makes it simple
+to scale via hash-slot sharding. Due to pipelining support, benchmarks should be run with high parallelism in order to benchmark the limiter, not RTT.
+Benchmarks run against Valkey 8.1.x running locally.
 
-
-## Benchmarks
-Run with high parallelism in order to benchmark the limiter, not the RTT. Benchmarks run against Redis 8.0
-running locally.
-
-`BenchmarkLimiter/Limiter/Exhausted_Parallel` (322ns/op) highlights the performance gain of caching wait times
-when the limiter is exhausted.
-
-By contrast, `BenchmarkLimiter/Replenishable/Exhausted_Parallel100-8` is 20x slower as a replenishable limiter
-is unable to cache waits.
-
-
-
+### tokenbucket algo
 ```
 goos: linux
 goarch: amd64
-pkg: github.com/iamcalledrob/ruebucket
-cpu: 11th Gen Intel(R) Core(TM) i7-1165G7 @ 2.80GHz
- BenchmarkLimiter
- BenchmarkLimiter/Limiter/Exhausted_Parallel100-8                 3903544              322.3 ns/op
- BenchmarkLimiter/Limiter/Allowed_Parallel100-8                    123291              9496 ns/op
- BenchmarkLimiter/Replenishable/Exhausted_Parallel100-8            178246              6485 ns/op
- BenchmarkLimiter/Replenishable/Allowed_Parallel100-8              117828              9901 ns/op
+pkg: github.com/iamcalledrob/ruerate/tokenbucket
+cpu: AMD Ryzen 5 8600G w/ Radeon 760M Graphics     
+
+BenchmarkRedisCacheableLimiter
+BenchmarkRedisCacheableLimiter/Exhausted_Serial
+BenchmarkRedisCacheableLimiter/Exhausted_Serial-12         	 6212396	       190.3 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRedisCacheableLimiter/Exhausted_Parallel100
+BenchmarkRedisCacheableLimiter/Exhausted_Parallel100-12    	 5814763	       208.5 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRedisCacheableLimiter/Allowed_Parallel100
+BenchmarkRedisCacheableLimiter/Allowed_Parallel100-12      	  238906	      4725 ns/op	      99 B/op	       1 allocs/op
+
+BenchmarkRedisLimiter
+BenchmarkRedisLimiter/Exhausted_Parallel100
+BenchmarkRedisLimiter/Exhausted_Parallel100-12    	  347024	      3381 ns/op	      93 B/op	       1 allocs/op
+BenchmarkRedisLimiter/Allowed_Parallel100
+BenchmarkRedisLimiter/Allowed_Parallel100-12      	  247245	      4706 ns/op	      98 B/op	       1 allocs/op
+
+BenchmarkLocalLimiter
+BenchmarkLocalLimiter/Exhausted_Serial
+BenchmarkLocalLimiter/Exhausted_Serial-12         	12621777	        98.36 ns/op	       0 B/op	       0 allocs/op
+BenchmarkLocalLimiter/Exhausted_Parallel100
+BenchmarkLocalLimiter/Exhausted_Parallel100-12    	 9617128	       128.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkLocalLimiter/Allowed_Parallel100
+BenchmarkLocalLimiter/Allowed_Parallel100-12      	11479965	       125.3 ns/op	       0 B/op	       0 allocs/op
+
 ```
+
+### backoff algo
+```
+goos: linux
+goarch: amd64
+pkg: github.com/iamcalledrob/ruerate/tokenbucket
+cpu: AMD Ryzen 5 8600G w/ Radeon 760M Graphics     
+
+BenchmarkRedisLimiter
+BenchmarkRedisLimiter/Allow_Serial
+BenchmarkRedisLimiter/Allow_Serial-12         	  185803	      6146 ns/op	     102 B/op	       1 allocs/op
+BenchmarkRedisLimiter/Allow_Parallel100
+BenchmarkRedisLimiter/Allow_Parallel100-12    	  356449	      3164 ns/op	      92 B/op	       1 allocs/op
+
+BenchmarkLocalLimiter
+BenchmarkLocalLimiter/Allow_Serial
+BenchmarkLocalLimiter/Allow_Serial-12         	15445687	        78.62 ns/op	       0 B/op	       0 allocs/op
+BenchmarkLocalLimiter/Allow_Parallel100
+BenchmarkLocalLimiter/Allow_Parallel100-12    	11196720	       120.3 ns/op	       0 B/op	       0 allocs/op
+
+BenchmarkLocalKeyedLimiter
+BenchmarkLocalKeyedLimiter/Allow_Serial
+BenchmarkLocalKeyedLimiter/Allow_Serial-12         	 6896593	       171.1 ns/op	       0 B/op	       0 allocs/op
+BenchmarkLocalKeyedLimiter/Allow_Parallel100
+BenchmarkLocalKeyedLimiter/Allow_Parallel100-12    	 6183844	       196.1 ns/op	       0 B/op	       0 allocs/op
+
+```
+
+## TODOs
+- [x] Migrate to common interface across local and redis token bucket limiters
+- [x] MILD backoff algorithm
+- [ ] Leaky bucket algorithm
+- [ ] backoff.RedisCacheableLimiter, to avoid any Redis round-trip when a client is known to been locked out.
