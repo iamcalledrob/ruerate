@@ -7,13 +7,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jellydator/ttlcache/v3"
+	"github.com/iamcalledrob/ruebucket/internal/safetime"
+	"github.com/iamcalledrob/ruebucket/internal/ttlmap"
 )
 
 // LocalKeyedLimiter is designed to mimic the redis-powered RedisKeyedLimiter,
 // but implements its algorithm locally in Go.
 type LocalKeyedLimiter struct {
-	limiters *ttlcache.Cache[string, *LocalLimiter]
+	opts     LimiterOpts
+	limiters *ttlmap.Map[string, *LocalLimiter]
 }
 
 func NewLocalKeyedLimiter(opts LimiterOpts) (*LocalKeyedLimiter, error) {
@@ -23,56 +25,57 @@ func NewLocalKeyedLimiter(opts LimiterOpts) (*LocalKeyedLimiter, error) {
 		return nil, fmt.Errorf("opts: %w", err)
 	}
 
-	// Lazily create local limiters when needed
-	// Using suppressed (single flight) loader ensures that there is never more than one
-	// limiter instance per key.
-	singleFlightLoader := ttlcache.NewSuppressedLoader(ttlcache.LoaderFunc[string, *LocalLimiter](
-		func(
-			limiters *ttlcache.Cache[string, *LocalLimiter], key string,
-		) *ttlcache.Item[string, *LocalLimiter] {
-			l, lErr := NewLocalLimiter(&opts)
-			if lErr != nil {
-				panic("NewLocalLimiter failed with pre-sanitized opts: " + lErr.Error())
-			}
-
-			// Initial ttl set to time it takes for 1 penalty to expire.
-			// Minimum amount of time the limiter could be relevant, assuming its used.
-			return limiters.Set(key, l, opts.PenaltyDecayInterval)
-		},
-	), nil)
-
-	limiters := ttlcache.New[string, *LocalLimiter](
-		ttlcache.WithLoader(singleFlightLoader),
-		ttlcache.WithDisableTouchOnHit[string, *LocalLimiter](), // No ttl magic, only change explicitly
-	)
-
-	// Purge expired limiters to prevent memory leak
-	go limiters.Start()
-
-	return &LocalKeyedLimiter{limiters: limiters}, nil
-}
-
-// Stop stops automatically cleaning up the limiter map
-// Call when no longer using LocalKeyedLimiter to avoid a goroutine leak.
-func (l *LocalKeyedLimiter) Stop() {
-	l.limiters.Stop()
+	return &LocalKeyedLimiter{
+		opts:     opts,
+		limiters: ttlmap.New[string, *LocalLimiter](),
+	}, nil
 }
 
 func (l *LocalKeyedLimiter) Reset(ctx context.Context, key string) error {
+	shard := l.limiters.Shard(key)
+	shard.Lock()
+	defer shard.Unlock()
+
 	// Deleting the limiter has the same effect as resetting it.
 	// A new, default one will be allocated when next needed.
-	// TODO: What happens if Delete is called during a call to Allow?
-	l.limiters.Delete(key)
+	shard.Delete(key)
 	return nil
 }
 
 func (l *LocalKeyedLimiter) Allow(ctx context.Context, key string) (ok bool, wait time.Duration, err error) {
-	entry := l.limiters.Get(key)
+	// Lock only this key's shard rather than the entire keyed limiter
+	var shard *ttlmap.Shard[string, *LocalLimiter]
+	shard = l.limiters.Shard(key)
+	shard.Lock()
+	defer shard.Unlock()
 
-	limiter := entry.Value()
-	ok, wait = limiter.allow(ctx, func(newTTL time.Duration) {
-		l.limiters.Set(key, limiter, newTTL)
-	})
+	// Propagate injected time into ttlmap shard, otherwise
+	// keys may expire prematurely
+	if isTesting {
+		if t := injectedTimeFromContext(ctx); t != nil {
+			shard.SetNow(t)
+			defer shard.SetNow(nil)
+		}
+	}
+
+	var limiter *LocalLimiter
+	limiter, _, ok = shard.Get(key)
+	if !ok {
+		limiter, err = NewLocalLimiter(&l.opts)
+		if err != nil {
+			panic("NewLocalLimiter failed with pre-sanitized opts: " + err.Error())
+		}
+	}
+
+	var decayedAt time.Time
+	ok, wait, decayedAt = limiter.allowLocked(ctx)
+	// If not allowed, the limiter will not have been mutated
+	if !ok {
+		return
+	}
+
+	// Set or replace (if already exists) existing map key
+	shard.Set(key, limiter, decayedAt)
 
 	return
 }
@@ -101,29 +104,30 @@ func NewLocalLimiter(opts *LimiterOpts) (*LocalLimiter, error) {
 func (l *LocalLimiter) Reset(_ context.Context) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-
-	l.penalty = 0
-	l.lastAcquiredAt = time.Time{}
-
+	l.resetLocked()
 	return nil
 }
 
-func (l *LocalLimiter) Allow(ctx context.Context) (ok bool, wait time.Duration, err error) {
-	ok, wait = l.allow(ctx, func(time.Duration) {})
-	return
+func (l *LocalLimiter) resetLocked() {
+	l.penalty = 0
+	l.lastAcquiredAt = time.Time{}
 }
 
-func (l *LocalLimiter) allow(
-	ctx context.Context,
-	onTTLChange func(newTTL time.Duration),
-) (ok bool, wait time.Duration) {
+func (l *LocalLimiter) Allow(ctx context.Context) (ok bool, wait time.Duration, err error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	ok, wait, _ = l.allowLocked(ctx)
+	return
+}
+
+func (l *LocalLimiter) allowLocked(ctx context.Context) (ok bool, wait time.Duration, decayedAt time.Time) {
 	// Time can be injected for testing
 	now := time.Now()
-	if t := injectedTimeFromContext(ctx); t != nil {
-		now = *t
+	if isTesting {
+		if t := injectedTimeFromContext(ctx); t != nil {
+			now = *t
+		}
 	}
 
 	// Calculate time since the last successful acquisition.
@@ -147,9 +151,11 @@ func (l *LocalLimiter) allow(
 		// We use max(0, l.penalty-1) as the exponent to ensure the first penalty,
 		// e.g. 1, is not scaled by GrowthFactor.
 		exp := max(0, l.penalty-1)
+		pow := math.Pow(l.opts.GrowthFactor, exp)
 		backoff = min(
-			time.Duration(float64(l.opts.BaseWait)*math.Pow(l.opts.GrowthFactor, exp)),
+			safetime.Duration(float64(l.opts.BaseWait)*pow),
 			l.opts.MaxWait,
+			l.opts.PenaltyDecayInterval,
 		)
 	}
 
@@ -165,14 +171,15 @@ func (l *LocalLimiter) allow(
 	l.penalty = min(l.penalty+1, l.opts.maxPenalty)
 	l.lastAcquiredAt = now
 
-	// Calculate TTL: how long until the current penalty decays to zero.
-	// This allows external caches (like ttlcache) to expire the record accurately.
-	// Callback invoked while l.mu is held, ensures no races with concurrent calls
-	ttl := time.Duration(l.penalty * float64(l.opts.PenaltyDecayInterval))
-	onTTLChange(ttl)
-
 	ok = true
 	wait = 0
 
+	// How long until the current penalty decays to zero.
+	// This is needed for external caches (like TTLMap) to expire the record accurately.
+	// safetime bounds checking
+	ttl := safetime.Duration(l.penalty * float64(l.opts.PenaltyDecayInterval))
+	decayedAt = safetime.Add(now, ttl)
 	return
 }
+
+var isTesting bool

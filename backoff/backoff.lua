@@ -5,6 +5,8 @@ local state_key = KEYS[1]
 
 local base_wait_micros = {{ BASE_WAIT_MICROS }}
 local max_wait_micros = {{ MAX_WAIT_MICROS }}
+-- precalculated in go
+local penalty_decay_interval_micros = {{ PENALTY_DECAY_INTERVAL_MICROS }}
 -- per_sec (not per_micro) because values can be very small even at this scale:
 --   e.g. decay every 30 mins = per_sec rate of 0.000555556
 -- Don't want to run into floating point precision issues
@@ -49,7 +51,8 @@ if penalty > 0 then
     local exp = math.max(0, penalty - 1)
     backoff_micros = math.min(
         base_wait_micros * math.pow(growth_factor, exp),
-        max_wait_micros
+        max_wait_micros,
+        penalty_decay_interval_micros
     )
 end
 

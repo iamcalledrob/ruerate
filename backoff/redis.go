@@ -53,6 +53,7 @@ func NewRedisKeyedBackoffLimiter(
 	s := strings.NewReplacer(
 		"{{ BASE_WAIT_MICROS }}", strconv.FormatInt(opts.LimiterOpts.BaseWait.Microseconds(), 10),
 		"{{ MAX_WAIT_MICROS }}", strconv.FormatInt(opts.LimiterOpts.MaxWait.Microseconds(), 10),
+		"{{ PENALTY_DECAY_INTERVAL_MICROS }}", strconv.FormatInt(opts.LimiterOpts.PenaltyDecayInterval.Microseconds(), 10),
 		"{{ PENALTY_DECAY_RATE }}", strconv.FormatFloat(ruerate.Every(opts.LimiterOpts.PenaltyDecayInterval), 'f', -1, 64),
 		"{{ GROWTH_FACTOR }}", strconv.FormatFloat(opts.LimiterOpts.GrowthFactor, 'f', -1, 64),
 		"{{ MAX_PENALTY }}", strconv.FormatFloat(opts.LimiterOpts.maxPenalty, 'f', -1, 64),

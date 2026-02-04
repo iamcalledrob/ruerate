@@ -31,6 +31,12 @@ func testLimiter_Common(
 	t.Run("MaxWait", func(t *testing.T) {
 		testLimiter_MaxWait(t, factory)
 	})
+	t.Run("Overflows", func(t *testing.T) {
+		testLimiter_Overflows(t, factory)
+	})
+	t.Run("NoOvershoot", func(t *testing.T) {
+		testLimiter_NoOvershoot(t, factory)
+	})
 	t.Run("PrematureAttemptsDontGrow", func(t *testing.T) {
 		testLimiter_PrematureAttemptsDontGrow(t, factory)
 	})
@@ -222,6 +228,8 @@ func testLimiter_AllowBeforeLast(
 	require.EqualValues(t, opts.BaseWait, wait)
 }
 
+// Important check, but also explains weird test results in other tests.
+
 // Ensures the base wait delay grows by the growthFactor
 // Inherent in this is that the first delay = unscaled BaseWait
 func testLimiter_GrowthFactor(
@@ -367,6 +375,71 @@ func testLimiter_MaxWait(
 	require.NoError(t, err)
 	require.False(t, ok)
 	require.InDelta(t, opts.BaseWait, wait, float64(time.Microsecond))
+}
+
+// Ensures wait times, when hammering, don't overshoot then undershoot
+// (then overshoot, then undershoot), which can happen.
+//
+// Overshoot can occur if MaxWait is clipped by PenaltyDecayInterval,
+// and the overshoots increase dramatically with higher GrowthFactors
+func testLimiter_NoOvershoot(
+	t *testing.T,
+	factory func(opts LimiterOpts) (Limiter, error),
+
+) {
+	l, err := factory(LimiterOpts{
+		BaseWait:             time.Second,
+		MaxWait:              time.Hour,
+		PenaltyDecayInterval: time.Minute,
+		GrowthFactor:         10.0,
+	})
+	require.NoError(t, err)
+
+	waits, _ := hammerLimiter(t, time.Now(), l, 200)
+
+	// If backoff isn't capped by PenaltyDecayInterval, waits in this config will look like:
+	// 1, 9.623506263, 66.518364452, 51.796707548, 70.961648441, 46.593952749, 77.940587624...
+	// (i.e. greater than PenaltyDecayInterval)
+
+	// Ensure waits only ever increase when hammering
+	for i, w := range waits {
+		if i == 0 {
+			continue
+		}
+		last := waits[i-1]
+		require.GreaterOrEqual(t, w, last)
+	}
+
+}
+
+func testLimiter_Overflows(
+	t *testing.T,
+	factory func(opts LimiterOpts) (Limiter, error),
+) {
+	opts := LimiterOpts{
+		BaseWait:             time.Duration(math.MaxInt64),
+		MaxWait:              time.Duration(math.MaxInt64),
+		PenaltyDecayInterval: time.Duration(math.MaxInt64),
+		GrowthFactor:         2,
+	}
+	l, err := factory(opts)
+	require.NoError(t, err)
+
+	var ok bool
+	ok, _, err = l.Allow(t.Context())
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	var wait time.Duration
+	ok, wait, err = l.Allow(t.Context())
+	require.NoError(t, err)
+	require.False(t, ok)
+
+	// Ensure wait has not overflowed to be negative
+	require.Greater(t, wait, time.Duration(0))
+
+	// Wait is positive, ensure wait is maxed out (allow a little slop for floating)
+	require.InDelta(t, math.MaxInt64, wait, float64(time.Second))
 }
 
 // Ensures that premature subsequent attempts don't grow the penalty,
@@ -586,4 +659,8 @@ func hammerLimiter(t *testing.T, now time.Time, l Limiter, n int) (results []flo
 
 	now2 = now
 	return
+}
+
+func init() {
+	isTesting = true
 }

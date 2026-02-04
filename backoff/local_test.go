@@ -41,17 +41,18 @@ func TestLocalKeyedLimiter(t *testing.T) {
 			require.True(t, ok)
 
 			// Check that an entry exists in the cache
-			// Ensure its TTL matches when the penalty would have fully decayed
+			// Ensure its expiry matches when the penalty would have fully decayed
 			// Allow 5% slop to avoid races with slow test runners etc.
-			entry := kl.limiters.Get("key")
-			require.NotNil(t, entry)
 
-			// Ensure TTL is set as expected
-			require.InDelta(t, 100*time.Millisecond, entry.TTL(), float64(5*time.Millisecond))
+			_, expiresAt, ok := kl.limiters.Shard(key).Get(key)
+			require.True(t, ok)
+
+			// Ensure expiresAt is set as expected
+			require.WithinDuration(t, time.Now().Add(100*time.Millisecond), expiresAt, 5*time.Millisecond)
 
 			// Ensure item does get removed after TTL expires
 			<-time.After(100 * time.Millisecond)
-			exists := kl.limiters.Has(key)
+			_, exists := kl.limiters.Shard(key).GetValue(key)
 			require.False(t, exists)
 		})
 
@@ -73,7 +74,7 @@ func TestLocalKeyedLimiter(t *testing.T) {
 			err = kl.Reset(t.Context(), key)
 			require.NoError(t, err)
 
-			exists := kl.limiters.Has(key)
+			_, exists := kl.limiters.Shard(key).GetValue(key)
 			require.False(t, exists)
 		})
 	})
