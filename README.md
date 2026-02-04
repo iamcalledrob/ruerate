@@ -21,12 +21,12 @@ Use-cases: API rate limiting, protecting from traffic spikes, and scenarios requ
 with occasional bursts.
 
 ### Implementations:
-- tokenbucket.LocalLimiter: Single-resource in-memory limiter.
-- tokenbucket.LocalKeyedLimiter: Per-key in-memory limiter.
-- tokenbucket.RedisLimiter: Distributed, replenishable single-resource limiter.
-- tokenbucket.RedisKeyedLimiter: Distributed, replenishable per-key limiter.
-- tokenbucket.RedisCacheableLimiter: More efficient version of `RedisLimiter` with client-side caching.
-- tokenbucket.RedisCacheableKeyedLimiter: More efficient version of `RedisKeyedLimiter` with client-side caching.
+- `tokenbucket.LocalLimiter`: Single-resource in-memory limiter.
+- `tokenbucket.LocalKeyedLimiter`: Per-key in-memory limiter.
+- `tokenbucket.RedisLimiter`: Distributed, replenishable single-resource limiter.
+- `tokenbucket.RedisKeyedLimiter`: Distributed, replenishable per-key limiter.
+- `tokenbucket.RedisCacheableLimiter`: More efficient version of `RedisLimiter` with client-side caching.
+- `tokenbucket.RedisCacheableKeyedLimiter`: More efficient version of `RedisKeyedLimiter` with client-side caching.
 
 ### Configuration
 The `tokenbucket.LimiterOpts` struct defines the bucket behavior:
@@ -78,6 +78,18 @@ loops, i.e. with the local in-memory variants.
 - `backoff.LocalKeyedLimiter`: Per-key in-memory backoff limiter
 - `backoff.RedisLimiter`: Distributed, single resource backoff limiter
 - `backoff.RedisKeyedLimiter`: Distributed, per-key backoff limiter
+
+### Configuration
+The `backoff.LimiterOpts` struct defines the bucket behavior:
+```
+type LimiterOpts struct {
+    BaseWait              time.Duration // Minimum wait between attempts
+    MaxWait               time.Duration // Maximum "lockout" duration
+    PenaltyDecayInterval  time.Duration // How long prior attempts take to be "forgotten"
+    GrowthFactor          float64       // How fast backoff grows. 2.0 doubles each time.
+}
+```
+
 
 ### Example (server)
 ```golang
