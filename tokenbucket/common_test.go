@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	ruerate "github.com/iamcalledrob/ruebucket"
+	"github.com/iamcalledrob/ruerate"
 	"github.com/stretchr/testify/require"
 )
 
@@ -219,4 +219,62 @@ func testKeyedLimiter_DistinctKeys(
 	ok, _, err = lim.Allow(t.Context(), "key2")
 	require.NoError(t, err)
 	require.True(t, ok)
+}
+
+func benchmarkLimiter(
+	b *testing.B,
+	factory func(opts LimiterOpts) (CacheableLimiter, error),
+) {
+	// Note: factory returns CacheableLimiter because its the smallest interface,
+	//       *not* because caching is required.
+
+	test := func(b *testing.B, p int, lim CacheableLimiter) {
+		b.ReportAllocs()
+		b.SetParallelism(p)
+		b.ResetTimer()
+
+		// In parallel because rueidis
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				_, _, _ = lim.Allow(b.Context())
+			}
+		})
+	}
+
+	// Parallel branches used to demonstrate that rueidis auto-pipelining is working.
+	b.Run("Exhausted_Serial", func(b *testing.B) {
+		lim, err := factory(LimiterOpts{
+			RatePerSec: ruerate.Every(100 * time.Millisecond),
+			Capacity:   1,
+		})
+		require.NoError(b, err)
+		test(b, 1, lim)
+	})
+	b.Run("Exhausted_Parallel100", func(b *testing.B) {
+		lim, err := factory(LimiterOpts{
+			RatePerSec: ruerate.Every(100 * time.Millisecond),
+			Capacity:   1,
+		})
+		require.NoError(b, err)
+		test(b, 100, lim)
+	})
+
+	// Tests the "allowed" path
+	b.Run("Allowed_Serial", func(b *testing.B) {
+		lim, err := factory(LimiterOpts{
+			RatePerSec: ruerate.Every(1 * time.Hour),
+			Capacity:   b.N,
+		})
+		require.NoError(b, err)
+		test(b, 1, lim)
+	})
+	b.Run("Allowed_Parallel100", func(b *testing.B) {
+		lim, err := factory(LimiterOpts{
+			RatePerSec: ruerate.Every(1 * time.Hour),
+			Capacity:   b.N,
+		})
+		require.NoError(b, err)
+		test(b, 100, lim)
+	})
+
 }

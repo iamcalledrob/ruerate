@@ -80,6 +80,22 @@ func TestLocalKeyedLimiter(t *testing.T) {
 	})
 }
 
+func BenchmarkLocalLimiter(b *testing.B) {
+	benchmarkLimiter(b, func(opts LimiterOpts) (Limiter, error) {
+		return NewLocalLimiter(&opts)
+	})
+}
+
+func BenchmarkLocalKeyedLimiter(b *testing.B) {
+	benchmarkLimiter(b, func(opts LimiterOpts) (Limiter, error) {
+		l, err := NewLocalKeyedLimiter(opts)
+		if err != nil {
+			return nil, err
+		}
+		return &singleKeyLocalBackoffLimiter{source: l}, nil
+	})
+}
+
 // Shim to allow testing of a local keyed limiter as a regular limiter
 type singleKeyLocalBackoffLimiter struct {
 	source *LocalKeyedLimiter

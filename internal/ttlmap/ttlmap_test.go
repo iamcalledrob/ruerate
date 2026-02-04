@@ -92,7 +92,7 @@ func BenchmarkSet(b *testing.B) {
 //
 // goos: linux
 // goarch: amd64
-// pkg: github.com/iamcalledrob/ruebucket/internal/ttlmap
+// pkg: github.com/iamcalledrob/ruerate/internal/ttlmap
 // cpu: AMD Ryzen 5 8600G w/ Radeon 760M Graphics
 // BenchmarkGetWithGC
 // BenchmarkGetWithGC/size=100

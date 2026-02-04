@@ -10,7 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/iamcalledrob/ruebucket/internal/ttlmap"
+	"github.com/iamcalledrob/ruerate/internal/ttlmap"
 	"github.com/redis/rueidis"
 )
 
@@ -20,11 +20,6 @@ type RedisKeyedLimiterOpts struct {
 	// RedisKey is the Redis key where the limiter state score should be stored
 	// for a given limiter key, e.g. limiter:users_by_ip:{key}
 	RedisKey func(key string) string
-
-	// CacheLockShards bounds the number of concurrent Redis calls that can be
-	// made when using RedisCacheableKeyedLimiter. Must be a power of 2.
-	// Defaults to 1024
-	CacheLockShards uint16
 }
 
 func (o *RedisKeyedLimiterOpts) Sanitize() error {
@@ -36,6 +31,16 @@ func (o *RedisKeyedLimiterOpts) Sanitize() error {
 		return fmt.Errorf("LimiterOpts: %w", err)
 	}
 	return nil
+}
+
+// DefaultRedisKeyedLimiterOpts creates a config that writes to the Redis key "limiter:name:{key}"
+func DefaultRedisKeyedLimiterOpts(name string, opts LimiterOpts) RedisKeyedLimiterOpts {
+	return RedisKeyedLimiterOpts{
+		LimiterOpts: opts,
+		RedisKey: func(key string) string {
+			return "limiter:" + name + ":{" + key + "}"
+		},
+	}
 }
 
 // RedisKeyedLimiter is a redis-backed token bucket rate limiter that supports attempting to take tokens
@@ -104,30 +109,41 @@ func (l *RedisKeyedLimiter) AllowN(ctx context.Context, key string, n int) (ok b
 			l.opts.RedisKey(key), // lua: state_key
 		},
 		[]string{
-			strconv.Itoa(-n), // lua: tokens_delta (acquiring 1 = delta of -1)
+			fastitoa(-n), // lua: tokens_delta (acquiring 1 = delta of -1)
 		},
 	)
 
 	// Redis lua script should respond with array of 2 ints
-	var ints []int64
-	ints, err = resp.AsIntSlice()
+	var arr []rueidis.RedisMessage
+	arr, err = resp.ToArray()
 	if err != nil {
 		err = fmt.Errorf("acquiring limiter key %s: %w", key, err)
 		return
 	}
-	if len(ints) != 2 {
-		err = fmt.Errorf("incorrect result length: %d", len(ints))
+	if len(arr) != 2 {
+		err = fmt.Errorf("incorrect result length: %d", len(arr))
 		return
 	}
 
-	allowed := ints[0] == 1
-	if allowed {
+	var allowed, wsecs int64
+	allowed, err = arr[0].AsInt64()
+	if err != nil {
+		err = fmt.Errorf("parsing arr[0] as int64: %w", err)
+		return
+	}
+	wsecs, err = arr[1].AsInt64()
+	if err != nil {
+		err = fmt.Errorf("parsing arr[1] as int64: %w", err)
+		return
+	}
+
+	if allowed == 1 {
 		ok = true
 		return
 	}
 
 	// Convert micros to nanos (time.Duration)
-	wait = time.Duration(ints[1] * 1000)
+	wait = time.Duration(wsecs * 1000)
 
 	// Sanity check
 	if wait < 1 {
@@ -236,6 +252,14 @@ func (o *RedisLimiterOpts) Sanitize() error {
 	return nil
 }
 
+// DefaultRedisLimiterOpts creates a config that writes to the Redis key "limiter:name"
+func DefaultRedisLimiterOpts(name string, opts LimiterOpts) RedisLimiterOpts {
+	return RedisLimiterOpts{
+		LimiterOpts: opts,
+		RedisKey:    "limiter:" + name,
+	}
+}
+
 // RedisLimiter is a convenience wrapper around a RedisKeyedLimiter that limits a single default key
 type RedisLimiter struct {
 	source *RedisKeyedLimiter
@@ -259,19 +283,6 @@ func NewRedisLimiter(client rueidis.Client, opts RedisLimiterOpts) (*RedisLimite
 	}
 
 	return &RedisLimiter{source: l}, nil
-}
-
-// NewRedisLimiterWithDefaultKey is a convenience initializer for an
-// unkeyed RedisLimiter that writes to Redis keys "limiter:{ID}"
-func NewRedisLimiterWithDefaultKey(
-	client rueidis.Client,
-	id string,
-	opts LimiterOpts,
-) (*RedisLimiter, error) {
-	return NewRedisLimiter(client, RedisLimiterOpts{
-		LimiterOpts: opts,
-		RedisKey:    "limiter:{" + id + "}",
-	})
 }
 
 func (l *RedisLimiter) Allow(ctx context.Context) (ok bool, wait time.Duration, err error) {
@@ -316,23 +327,18 @@ func NewRedisCacheableLimiter(client rueidis.Client, opts RedisLimiterOpts) (*Re
 	return &RedisCacheableLimiter{source: l}, nil
 }
 
-// NewRedisCacheableLimiterWithDefaultKey is a convenience initializer for an
-// unkeyed RedisCacheableLimiter that writes to Redis keys "limiter:{ID}"
-func NewRedisCacheableLimiterWithDefaultKey(
-	client rueidis.Client,
-	id string,
-	opts LimiterOpts,
-) (*RedisCacheableLimiter, error) {
-	// Currently uses the default number of ttlmap shards (32?) even though there's
-	// only one key. Unlikely to be a big deal, but could be improved.
-	return NewRedisCacheableLimiter(client, RedisLimiterOpts{
-		LimiterOpts: opts,
-		RedisKey:    "limiter:{" + id + "}",
-	})
-}
-
 func (l *RedisCacheableLimiter) Allow(ctx context.Context) (ok bool, wait time.Duration, err error) {
 	return l.source.Allow(ctx, "")
+}
+
+func fastitoa(i int) string {
+	// Zero alloc for most common cases
+	if i == 1 {
+		return "1"
+	} else if i == -1 {
+		return "-1"
+	}
+	return strconv.Itoa(i)
 }
 
 //go:embed token_bucket.lua

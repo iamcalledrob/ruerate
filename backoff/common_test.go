@@ -661,6 +661,39 @@ func hammerLimiter(t *testing.T, now time.Time, l Limiter, n int) (results []flo
 	return
 }
 
+func benchmarkLimiter(
+	b *testing.B,
+	factory func(opts LimiterOpts) (Limiter, error),
+) {
+	// Note: factory returns CacheableLimiter because its the smallest interface,
+	//       *not* because caching is required.
+
+	test := func(b *testing.B, p int, lim Limiter) {
+		b.ReportAllocs()
+		b.SetParallelism(p)
+		b.ResetTimer()
+
+		// In parallel because rueidis
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				_, _, _ = lim.Allow(b.Context())
+			}
+		})
+	}
+
+	// Parallel branches used to demonstrate that rueidis auto-pipelining is working.
+	b.Run("Allow_Serial", func(b *testing.B) {
+		lim, err := factory(LimiterOpts{})
+		require.NoError(b, err)
+		test(b, 1, lim)
+	})
+	b.Run("Allow_Parallel100", func(b *testing.B) {
+		lim, err := factory(LimiterOpts{})
+		require.NoError(b, err)
+		test(b, 100, lim)
+	})
+}
+
 func init() {
 	isTesting = true
 }

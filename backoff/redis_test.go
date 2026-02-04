@@ -4,13 +4,13 @@ import (
 	"testing"
 	"time"
 
-	ruerate "github.com/iamcalledrob/ruebucket"
+	"github.com/iamcalledrob/ruerate"
 	"github.com/stretchr/testify/require"
 )
 
 func TestRedisLimiter(t *testing.T) {
 	testLimiter_Common(t, func(opts LimiterOpts) (Limiter, error) {
-		return NewRedisBackoffLimiter(ruerate.NewTestRedisClient(t), RedisLimiterOpts{
+		return NewRedisLimiter(ruerate.NewTestRedisClient(t), RedisLimiterOpts{
 			LimiterOpts: opts,
 			RedisKey:    "limiter:test",
 		})
@@ -31,7 +31,7 @@ func TestRedisLimiter(t *testing.T) {
 		}
 
 		client := ruerate.NewTestRedisClient(t)
-		l, err := NewRedisKeyedBackoffLimiter(client, opts)
+		l, err := NewRedisKeyedLimiter(client, opts)
 		require.NoError(t, err)
 
 		var redisTimeParts []int64
@@ -75,5 +75,11 @@ func TestRedisLimiter(t *testing.T) {
 		// TTLs should be 1000ms -- i.e. PenaltyDecayRate
 		require.InDelta(t, 1000*time.Millisecond, time.Duration(gotTtlMs)*time.Millisecond, float64(10*time.Millisecond))
 
+	})
+}
+
+func BenchmarkRedisLimiter(b *testing.B) {
+	benchmarkLimiter(b, func(opts LimiterOpts) (Limiter, error) {
+		return NewRedisLimiter(ruerate.NewTestRedisClient(b), DefaultRedisLimiterOpts("a", opts))
 	})
 }

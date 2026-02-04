@@ -6,8 +6,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/iamcalledrob/ruebucket/internal/safetime"
-	"github.com/iamcalledrob/ruebucket/internal/ttlmap"
+	"github.com/iamcalledrob/ruerate/internal/safetime"
+	"github.com/iamcalledrob/ruerate/internal/ttlmap"
 )
 
 // Local token bucket limiters that match behaviour of the replenishable redis counterparts.

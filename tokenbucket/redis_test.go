@@ -1,11 +1,10 @@
 package tokenbucket
 
 import (
-	"context"
 	"testing"
 	"time"
 
-	"github.com/iamcalledrob/ruebucket"
+	"github.com/iamcalledrob/ruerate"
 	"github.com/stretchr/testify/require"
 )
 
@@ -123,101 +122,13 @@ func TestRedisLimiter(t *testing.T) {
 }
 
 func BenchmarkRedisLimiter(b *testing.B) {
-	type Allower interface {
-		Allow(context.Context) (bool, time.Duration, error)
-	}
-
-	test := func(b *testing.B, p int, lim Allower) {
-		b.ReportAllocs()
-		b.SetParallelism(p)
-		b.ResetTimer()
-
-		// In parallel because rueidis
-		b.RunParallel(func(pb *testing.PB) {
-			for pb.Next() {
-				_, _, _ = lim.Allow(b.Context())
-			}
-		})
-	}
-
-	// Parallel branches used to demonstrate that rueidis auto-pipelining is working.
-
-	// Cacheable limiter locally caches the exhausted state of the limiter and wait time
-	b.Run("Cacheable", func(b *testing.B) {
-		b.Run("Exhausted_Serial", func(b *testing.B) {
-			lim, err := NewRedisCacheableLimiterWithDefaultKey(ruerate.NewTestRedisClient(b), "id", LimiterOpts{
-				RatePerSec: ruerate.Every(100 * time.Millisecond),
-				Capacity:   1,
-			})
-			require.NoError(b, err)
-			test(b, 1, lim)
-		})
-		b.Run("Exhausted_Parallel100", func(b *testing.B) {
-			lim, err := NewRedisCacheableLimiterWithDefaultKey(ruerate.NewTestRedisClient(b), "id", LimiterOpts{
-				RatePerSec: ruerate.Every(1 * time.Hour),
-				Capacity:   1,
-			})
-			require.NoError(b, err)
-			test(b, 100, lim)
-		})
-
-		// Tests the "allowed" path
-		b.Run("Allowed_Serial", func(b *testing.B) {
-			lim, err := NewRedisCacheableLimiterWithDefaultKey(ruerate.NewTestRedisClient(b), "id", LimiterOpts{
-				RatePerSec: ruerate.Every(1 * time.Hour),
-				Capacity:   b.N,
-			})
-			require.NoError(b, err)
-			test(b, 1, lim)
-		})
-		b.Run("Allowed_Parallel100", func(b *testing.B) {
-			lim, err := NewRedisCacheableLimiterWithDefaultKey(ruerate.NewTestRedisClient(b), "id", LimiterOpts{
-				RatePerSec: ruerate.Every(1 * time.Hour),
-				Capacity:   b.N,
-			})
-			require.NoError(b, err)
-			test(b, 100, lim)
-		})
+	benchmarkLimiter(b, func(opts LimiterOpts) (CacheableLimiter, error) {
+		return NewRedisLimiter(ruerate.NewTestRedisClient(b), DefaultRedisLimiterOpts("a", opts))
 	})
+}
 
-	// Tests the "exhausted cache" path -- different perf profile in token bucket lua
-	b.Run("NonCachable", func(b *testing.B) {
-		b.Run("Exhausted_Serial", func(b *testing.B) {
-			lim, err := NewRedisLimiterWithDefaultKey(ruerate.NewTestRedisClient(b), "id", LimiterOpts{
-				RatePerSec: ruerate.Every(100 * time.Millisecond),
-				Capacity:   1,
-			})
-			require.NoError(b, err)
-			test(b, 1, lim)
-		})
-		b.Run("Exhausted_Parallel100", func(b *testing.B) {
-			lim, err := NewRedisLimiterWithDefaultKey(ruerate.NewTestRedisClient(b), "id", LimiterOpts{
-				RatePerSec: ruerate.Every(1 * time.Hour),
-				Capacity:   1,
-			})
-			require.NoError(b, err)
-			test(b, 100, lim)
-		})
-
-		// Tests the "allowed" path
-		b.Run("Allowed_Serial", func(b *testing.B) {
-			lim, err := NewRedisLimiterWithDefaultKey(ruerate.NewTestRedisClient(b), "id", LimiterOpts{
-				RatePerSec: ruerate.Every(1 * time.Hour),
-				Capacity:   b.N,
-			})
-			require.NoError(b, err)
-			test(b, 1, lim)
-		})
-		b.Run("Allowed_Parallel100", func(b *testing.B) {
-			lim, err := NewRedisLimiterWithDefaultKey(ruerate.NewTestRedisClient(b), "id", LimiterOpts{
-				RatePerSec: ruerate.Every(1 * time.Hour),
-				Capacity:   b.N,
-			})
-			require.NoError(b, err)
-			test(b, 100, lim)
-		})
+func BenchmarkRedisCacheableLimiter(b *testing.B) {
+	benchmarkLimiter(b, func(opts LimiterOpts) (CacheableLimiter, error) {
+		return NewRedisCacheableLimiter(ruerate.NewTestRedisClient(b), DefaultRedisLimiterOpts("a", opts))
 	})
-
-	// The bulk of the overhead is invoking a lua script, which seems to be ~18,000ns/op
-	// Still, that's about 55K ops/sec which is screaming.
 }

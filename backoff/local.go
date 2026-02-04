@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/iamcalledrob/ruebucket/internal/safetime"
-	"github.com/iamcalledrob/ruebucket/internal/ttlmap"
+	"github.com/iamcalledrob/ruerate/internal/safetime"
+	"github.com/iamcalledrob/ruerate/internal/ttlmap"
 )
 
 // LocalKeyedLimiter is designed to mimic the redis-powered RedisKeyedLimiter,
@@ -90,9 +90,9 @@ type LocalLimiter struct {
 	lastAcquiredAt time.Time
 }
 
+// NewLocalLimiter instantiates a single in-memory limiter instance.
+// Opts is a pointer to allow common opts to be shared across multiple instances.
 func NewLocalLimiter(opts *LimiterOpts) (*LocalLimiter, error) {
-	// opts is pointer to allow common opts to be shared across multiple instances
-	// held in LocalKeyedBackoffLimiter
 	err := opts.Sanitize()
 	if err != nil {
 		return nil, fmt.Errorf("opts: %w", err)

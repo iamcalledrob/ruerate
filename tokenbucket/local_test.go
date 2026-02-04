@@ -1,11 +1,12 @@
 package tokenbucket
 
 import (
+	"context"
 	"math"
 	"testing"
 	"time"
 
-	ruerate "github.com/iamcalledrob/ruebucket"
+	"github.com/iamcalledrob/ruerate"
 	"github.com/stretchr/testify/require"
 )
 
@@ -126,5 +127,29 @@ func TestLocalKeyedLimiter(t *testing.T) {
 		_, expiresAt, ok = lim.limiters.Shard("key").Get("key")
 		require.WithinDuration(t, time.Now().Add(3250*time.Millisecond), expiresAt, 50*time.Millisecond)
 	})
+}
 
+func BenchmarkLocalLimiter(b *testing.B) {
+	benchmarkLimiter(b, func(opts LimiterOpts) (CacheableLimiter, error) {
+		return NewLocalLimiter(&opts)
+	})
+}
+
+func BenchmarkLocalKeyedLimiter(b *testing.B) {
+	benchmarkLimiter(b, func(opts LimiterOpts) (CacheableLimiter, error) {
+		l, err := NewLocalKeyedLimiter(opts)
+		if err != nil {
+			return nil, err
+		}
+		return &singleKeyLocalBackoffLimiter{source: l}, nil
+	})
+}
+
+type singleKeyLocalBackoffLimiter struct {
+	source *LocalKeyedLimiter
+}
+
+func (l *singleKeyLocalBackoffLimiter) Allow(ctx context.Context) (ok bool, wait time.Duration, err error) {
+	ok, wait, err = l.source.Allow(ctx, "default")
+	return
 }

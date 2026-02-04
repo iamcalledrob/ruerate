@@ -2,6 +2,7 @@ package ruerate
 
 import (
 	"math"
+	"math/rand/v2"
 	"os"
 	"testing"
 	"time"
@@ -38,4 +39,8 @@ func Every(interval time.Duration) float64 {
 	return 1 / interval.Seconds()
 }
 
-var AllowEvery = Every // Backwards compat
+// WithJitter is a convenience function to use with wait times returned from limiter Allow methods.
+// In the real world, jitter should almost certainly be applied.
+func WithJitter(wait time.Duration, amount float64) time.Duration {
+	return wait + time.Duration(float64(wait)*rand.Float64()*amount)
+}
