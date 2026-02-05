@@ -1,4 +1,4 @@
-module github.com/iamcalledrob/ruerate
+module github.com/iamcalledrob/ruerate/v2
 
 go 1.24
 
